@@ -433,5 +433,9 @@ describe('DB contract hardening', () => {
     const idempotencySql = readFileSync(resolve(__dirname, '../../migrations/004_idempotency_dirty_contract.sql'), 'utf-8');
     expect(idempotencySql).toContain('ADD COLUMN IF NOT EXISTS request_fingerprint');
     expect(idempotencySql).toContain('ADD COLUMN IF NOT EXISTS response_problem_id');
+    const activeJobGuardSql = readFileSync(resolve(__dirname, '../../migrations/007_active_job_guards.sql'), 'utf-8');
+    expect(activeJobGuardSql).toContain('idx_jobs_one_active_problem_job_type');
+    expect(activeJobGuardSql).toContain('idx_jobs_one_running_problem_operation');
+    expect(activeJobGuardSql).toContain("job_type IN ('scan', 'snapshot', 'restore', 'evict')");
   });
 });

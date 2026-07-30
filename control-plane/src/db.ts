@@ -16,6 +16,12 @@ export class IdempotencyConflictError extends Error {
     this.name = 'IdempotencyConflictError';
   }
 }
+export class ProblemOperationConflictError extends Error {
+  constructor(problemId: string) {
+    super(`Another local storage operation is already active for problem ${problemId}`);
+    this.name = 'ProblemOperationConflictError';
+  }
+}
 export class CatalogCodeConflictError extends Error {
   constructor(code: string, externalId: string) {
     super(`Problem code ${code} is already owned by catalog problem ${externalId}`);
@@ -840,8 +846,20 @@ function rowToSnapshot(r: Record<string, unknown>): SnapshotT {
 // Jobs
 // ===========================================================================
 
+type JobQueryable = Pick<Pool | PoolClient, 'query'>;
+
+const localProblemJobTypes = ['scan', 'snapshot', 'restore', 'evict'];
+
+function isActiveProblemOperationConstraint(err: unknown): boolean {
+  const pg = err as { code?: string; constraint?: string };
+  return pg?.code === '23505' && (
+    pg?.constraint === 'idx_jobs_one_active_problem_job_type'
+    || pg?.constraint === 'idx_jobs_one_running_problem_operation'
+  );
+}
+
 export async function createJob(
-  pool: Pool, opts: {
+  pool: JobQueryable, opts: {
     idempotencyKey: string; jobType: string; problemId: string | null;
     targetGeneration: number | null; leaseOwner: string; requestFingerprint?: string;
   },
@@ -851,9 +869,19 @@ export async function createJob(
     problem_id: opts.problemId,
     target_generation: opts.targetGeneration,
   });
-  const { rows } = await pool.query(
+  let rows: Record<string, unknown>[];
+  try {
+    ({ rows } = await pool.query(
     `WITH lock AS (
-       SELECT pg_advisory_xact_lock(hashtextextended($2 || ':' || COALESCE($3, '') || ':' || COALESCE($4::text, ''), 0))
+       SELECT pg_advisory_xact_lock(hashtextextended(
+         CASE
+           WHEN $3::text IS NOT NULL
+             AND $2::text = ANY(ARRAY['scan','snapshot','restore','evict']::text[])
+             THEN 'problem-operation:' || $3::text
+           ELSE $2::text || ':' || COALESCE($3::text, '') || ':' || COALESCE($4::text, '')
+         END,
+         0
+       ))
      ),
      key_row AS MATERIALIZED (
        SELECT j.*
@@ -888,7 +916,7 @@ export async function createJob(
          WHERE job_type = $2
            AND problem_id IS NOT DISTINCT FROM $3
            AND target_generation IS NOT DISTINCT FROM $4::integer
-           AND request_fingerprint = $5
+           AND (request_fingerprint = $5 OR $2 = ANY(ARRAY['scan','snapshot','restore']))
            AND state IN ('pending', 'running')
            AND NOT EXISTS (SELECT 1 FROM replay)
            AND NOT EXISTS (SELECT 1 FROM key_conflict)
@@ -897,6 +925,21 @@ export async function createJob(
        )
        RETURNING *
      ),
+     incompatible AS (
+       SELECT 1
+       FROM jobs, lock
+       WHERE $3::text IS NOT NULL
+         AND jobs.problem_id = $3::text
+         AND jobs.job_type = ANY(ARRAY['scan','snapshot','restore','evict']::text[])
+         AND jobs.state IN ('pending', 'running')
+         AND NOT (
+           ($2::text = 'scan' AND jobs.job_type = 'snapshot')
+           OR ($2::text = 'snapshot' AND jobs.job_type = 'scan')
+         )
+         AND NOT EXISTS (SELECT 1 FROM active)
+         AND NOT EXISTS (SELECT 1 FROM replay)
+       LIMIT 1
+     ),
      inserted AS (
        INSERT INTO jobs (idempotency_key, job_type, problem_id, target_generation, state, lease_owner, lease_expires_at, fencing_token, attempt, max_attempts, request_fingerprint)
        SELECT $1, $2, $3, $4::integer, 'pending', NULL, NULL, 0, 1, 3, $5
@@ -904,6 +947,7 @@ export async function createJob(
        WHERE NOT EXISTS (SELECT 1 FROM replay)
          AND NOT EXISTS (SELECT 1 FROM active)
          AND NOT EXISTS (SELECT 1 FROM key_conflict)
+         AND NOT EXISTS (SELECT 1 FROM incompatible)
        ON CONFLICT (idempotency_key, job_type) DO UPDATE SET
          updated_at = now()
        WHERE jobs.problem_id IS NOT DISTINCT FROM EXCLUDED.problem_id
@@ -918,9 +962,135 @@ export async function createJob(
      SELECT * FROM inserted
      LIMIT 1`,
     [opts.idempotencyKey, opts.jobType, opts.problemId, opts.targetGeneration, fingerprint],
-  );
-  if (!rows[0]) throw new IdempotencyConflictError();
+    ));
+  } catch (err) {
+    if (opts.problemId && isActiveProblemOperationConstraint(err)) {
+      throw new ProblemOperationConflictError(opts.problemId);
+    }
+    throw err;
+  }
+  if (!rows[0]) {
+    const keyConflict = await pool.query(
+      `SELECT 1 FROM jobs
+       WHERE idempotency_key = $1 AND job_type = $2
+       LIMIT 1`,
+      [opts.idempotencyKey, opts.jobType],
+    );
+    if (keyConflict.rows[0]) throw new IdempotencyConflictError();
+    if (opts.problemId && localProblemJobTypes.includes(opts.jobType)) {
+      const active = await pool.query(
+        `SELECT 1 FROM jobs
+         WHERE problem_id = $1
+           AND job_type = ANY($2::text[])
+           AND state IN ('pending', 'running')
+         LIMIT 1`,
+        [opts.problemId, localProblemJobTypes],
+      );
+      if (active.rows[0]) throw new ProblemOperationConflictError(opts.problemId);
+    }
+    throw new Error('Job creation produced no result');
+  }
   return rowToJob(rows[0]);
+}
+
+export async function createRestoreJobIfMissing(
+  pool: Pool,
+  opts: {
+    idempotencyKey: string;
+    problemId: string;
+    targetGeneration: number;
+    leaseOwner: string;
+    requestFingerprint: string;
+    missingObservedAt: string;
+  },
+): Promise<{ ready: true; job: null } | { ready: false; job: JobT }> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `SELECT pg_advisory_xact_lock(
+         hashtextextended('problem-operation:' || $1, 0)
+       )`,
+      [opts.problemId],
+    );
+
+    const replay = await client.query(
+      `SELECT * FROM jobs
+       WHERE idempotency_key = $1 AND job_type = 'restore'
+       FOR UPDATE`,
+      [opts.idempotencyKey],
+    );
+    if (replay.rows[0]) {
+      const replayRow = replay.rows[0];
+      const job = rowToJob(replayRow);
+      if (
+        job.problem_id !== opts.problemId
+        || job.target_generation !== opts.targetGeneration
+        || String(replayRow.request_fingerprint ?? '') !== opts.requestFingerprint
+      ) {
+        throw new IdempotencyConflictError();
+      }
+      await client.query('COMMIT');
+      return { ready: false, job };
+    }
+
+    const active = await client.query(
+      `SELECT * FROM jobs
+       WHERE problem_id = $1
+         AND job_type = 'restore'
+         AND target_generation = $2
+         AND state IN ('pending', 'running')
+       ORDER BY created_at ASC, id ASC
+       LIMIT 1
+       FOR UPDATE`,
+      [opts.problemId, opts.targetGeneration],
+    );
+    if (active.rows[0]) {
+      await client.query('COMMIT');
+      return { ready: false, job: rowToJob(active.rows[0]) };
+    }
+
+    const usage = await client.query(
+      `SELECT local_status, observed_at
+       FROM problem_usage
+       WHERE problem_id = $1
+       FOR UPDATE`,
+      [opts.problemId],
+    );
+    if (
+      usage.rows[0]?.local_status === 'present'
+      && new Date(usage.rows[0].observed_at).getTime() >= new Date(opts.missingObservedAt).getTime()
+    ) {
+      await client.query('COMMIT');
+      return { ready: true, job: null };
+    }
+
+    await client.query(
+      `INSERT INTO problem_usage (problem_id, local_status, observed_at, stale)
+       VALUES ($1, 'missing', $2::timestamptz, false)
+       ON CONFLICT (problem_id) DO UPDATE SET
+         local_status = 'missing',
+         observed_at = GREATEST(problem_usage.observed_at, EXCLUDED.observed_at),
+         stale = false`,
+      [opts.problemId, opts.missingObservedAt],
+    );
+
+    const job = await createJob(client, {
+      idempotencyKey: opts.idempotencyKey,
+      jobType: 'restore',
+      problemId: opts.problemId,
+      targetGeneration: opts.targetGeneration,
+      leaseOwner: opts.leaseOwner,
+      requestFingerprint: opts.requestFingerprint,
+    });
+    await client.query('COMMIT');
+    return { ready: false, job };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 export async function allocateGeneration(pool: Pool, problemId: string): Promise<number> {
@@ -941,7 +1111,9 @@ async function allocateGenerationOnClient(client: Pick<Pool | PoolClient, 'query
 
 export async function acquireJob(pool: Pool, workerId: string, leaseSeconds: number): Promise<JobT | null> {
   await failExpiredRunningJobs(pool);
-  const { rows } = await pool.query(
+  let rows: Record<string, unknown>[];
+  try {
+    ({ rows } = await pool.query(
     `WITH candidate AS (
        SELECT id FROM jobs
        WHERE attempt < max_attempts
@@ -972,7 +1144,11 @@ export async function acquireJob(pool: Pool, workerId: string, leaseSeconds: num
      WHERE j.id = candidate.id AND j.attempt < j.max_attempts
      RETURNING j.*`,
     [workerId, leaseSeconds],
-  );
+    ));
+  } catch (err) {
+    if (isActiveProblemOperationConstraint(err)) return null;
+    throw err;
+  }
   return rows[0] ? rowToJob(rows[0]) : null;
 }
 

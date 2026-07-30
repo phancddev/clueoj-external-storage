@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { buildRoutes } from './routes.js';
 import { signOperatorToken, signServiceToken } from './auth.js';
 import { DUMMY_PASSWORD_HASH, hashPassword } from './password.js';
+import { stableFingerprint } from './db.js';
 import type { Env } from './env.js';
 
 const env: Env = {
@@ -63,9 +64,19 @@ class FakePool {
 
 class EnsureReadyPool {
   constructor(private mode: 'ready' | 'restore' | 'unavailable' | 'snapshotting' | 'terminal' | 'partial-clean' | 'partial-dirty') {}
+  async connect() {
+    return {
+      query: (sql: string, params: unknown[] = []) => this.query(sql, params),
+      release: () => {},
+    };
+  }
   async query(sql: string, params: unknown[] = []) {
     const dashboardUser = dashboardUserResult(sql, params);
     if (dashboardUser) return dashboardUser;
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [], rowCount: 0 };
+    if (sql.includes('pg_advisory_xact_lock') && !sql.includes('INSERT INTO jobs')) {
+      return { rows: [{}], rowCount: 1 };
+    }
     if (sql.includes('SELECT * FROM problems WHERE external_id')) {
       return { rows: [{
         external_id: 'p1',
@@ -119,6 +130,37 @@ class EnsureReadyPool {
     if (sql.includes('INSERT INTO problem_generation_counters')) {
       return { rows: [{ generation: 10 }], rowCount: 1 };
     }
+    if (sql.includes('SELECT * FROM jobs') && sql.includes("job_type = 'restore'")) {
+      if (this.mode !== 'terminal') return { rows: [], rowCount: 0 };
+      return { rows: [{
+        id: 'job-restore',
+        idempotency_key: 'idem-ensure',
+        job_type: 'restore',
+        problem_id: 'p1',
+        target_generation: 9,
+        state: 'failed',
+        lease_owner: null,
+        lease_expires_at: null,
+        fencing_token: 1,
+        attempt: 1,
+        max_attempts: 3,
+        request_fingerprint: stableFingerprint({
+          action: 'ensure-ready-restore',
+          external_id: 'p1',
+          generation: 9,
+        }),
+        result: null,
+        error_code: 'job_failed',
+        error_message: 'failed',
+        created_at: new Date(),
+        updated_at: new Date(),
+        completed_at: new Date(),
+      }], rowCount: 1 };
+    }
+    if (sql.includes('SELECT local_status, observed_at') && sql.includes('FROM problem_usage')) {
+      return { rows: [], rowCount: 0 };
+    }
+    if (sql.includes('INSERT INTO problem_usage')) return { rows: [], rowCount: 1 };
     if (sql.includes('INSERT INTO jobs')) {
       return { rows: [{
         id: this.mode === 'snapshotting' ? 'job-snapshot' : 'job-restore',

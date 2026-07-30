@@ -195,6 +195,9 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
     if (err instanceof db.IdempotencyConflictError) {
       return reply.code(409).send({ code: 'idempotency_conflict', message: err.message, retryable: false, request_id: requestId });
     }
+    if (err instanceof db.ProblemOperationConflictError) {
+      return reply.code(409).send({ code: 'problem_operation_conflict', message: err.message, retryable: true, request_id: requestId });
+    }
     if (err instanceof db.CatalogCodeConflictError) {
       return reply.code(409).send({ code: 'catalog_code_conflict', message: err.message, retryable: false, request_id: requestId });
     }
@@ -462,18 +465,22 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
     }
     if (actual.local_status === 'present' && problem.dirty) {
       const generation = problem.dirty_generation ?? await db.allocateGeneration(ctx.pool, externalId);
-      const job = await db.createJob(ctx.pool, {
-        idempotencyKey: key,
-        jobType: 'snapshot',
-        problemId: externalId,
-        targetGeneration: generation,
-        leaseOwner: getAuth(req).sub,
-        requestFingerprint: db.stableFingerprint({ action: 'ensure-ready-snapshot', external_id: externalId, generation, dirty_version: problem.dirty_version }),
-      });
-      if (rejectTerminalEnsureJob(reply, job, getRequestId(req))) return;
-      await db.setJobPayload(ctx.pool, job.id, { dirty_version: problem.dirty_version });
-      await audit(ctx, req, 'problem.ensure_ready_snapshot', { problemId: externalId, generation, jobId: job.id });
-      return reply.code(202).send({ status: 'snapshotting', ready: false, ...accepted(job) });
+      try {
+        const job = await db.createJob(ctx.pool, {
+          idempotencyKey: key,
+          jobType: 'snapshot',
+          problemId: externalId,
+          targetGeneration: generation,
+          leaseOwner: getAuth(req).sub,
+          requestFingerprint: db.stableFingerprint({ action: 'ensure-ready-snapshot', external_id: externalId, generation, dirty_version: problem.dirty_version }),
+        });
+        if (rejectTerminalEnsureJob(reply, job, getRequestId(req))) return;
+        await db.setJobPayload(ctx.pool, job.id, { dirty_version: problem.dirty_version });
+        await audit(ctx, req, 'problem.ensure_ready_snapshot', { problemId: externalId, generation, jobId: job.id });
+        return reply.code(202).send({ status: 'snapshotting', ready: false, ...accepted(job) });
+      } catch (err) {
+        return sendJobError(reply, err, getRequestId(req));
+      }
     }
     if (actual.local_status !== 'missing') {
       return reply.code(409).send({
@@ -487,17 +494,30 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
     if (!snapshot) {
       return reply.code(409).send({ code: 'not_ready', message: 'No local folder and no READY snapshot available', retryable: true, request_id: getRequestId(req) });
     }
-    const job = await db.createJob(ctx.pool, {
-      idempotencyKey: key,
-      jobType: 'restore',
-      problemId: externalId,
-      targetGeneration: snapshot.generation,
-      leaseOwner: getAuth(req).sub,
-      requestFingerprint: db.stableFingerprint({ action: 'ensure-ready-restore', external_id: externalId, generation: snapshot.generation }),
-    });
-    if (rejectTerminalEnsureJob(reply, job, getRequestId(req))) return;
-    await audit(ctx, req, 'problem.ensure_ready', { problemId: externalId, generation: snapshot.generation, jobId: job.id });
-    reply.code(202).send({ status: 'restoring', ready: false, ...accepted(job) });
+    try {
+      const fingerprint = db.stableFingerprint({
+        action: 'ensure-ready-restore',
+        external_id: externalId,
+        generation: snapshot.generation,
+      });
+      const claim = await db.createRestoreJobIfMissing(ctx.pool, {
+        idempotencyKey: key,
+        problemId: externalId,
+        targetGeneration: snapshot.generation,
+        leaseOwner: getAuth(req).sub,
+        requestFingerprint: fingerprint,
+        missingObservedAt: actual.observed_at,
+      });
+      if (claim.ready) {
+        return reply.send({ status: 'ready', ready: true });
+      }
+      const job = claim.job;
+      if (rejectTerminalEnsureJob(reply, job, getRequestId(req))) return;
+      await audit(ctx, req, 'problem.ensure_ready', { problemId: externalId, generation: snapshot.generation, jobId: job.id });
+      reply.code(202).send({ status: 'restoring', ready: false, ...accepted(job) });
+    } catch (err) {
+      return sendJobError(reply, err, getRequestId(req));
+    }
   });
 
   app.post('/api/v1/problems/:externalId/scan', { schema: { response: { 202: AcceptedJobResponse, default: ErrorResponse } } }, async (req, reply) => {
@@ -554,11 +574,23 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
     try {
       const idempotencyKey = getIdempotencyKey(req, reply);
       if (!idempotencyKey) return;
+      const snapshot = body.generation === undefined
+        ? await db.getLatestReadySnapshot(ctx.pool, externalId)
+        : null;
+      const generation = body.generation ?? snapshot?.generation ?? null;
+      if (generation === null) {
+        return reply.code(409).send({
+          code: 'not_ready',
+          message: 'No READY snapshot is available to restore',
+          retryable: true,
+          request_id: getRequestId(req),
+        });
+      }
       const job = await db.createJob(ctx.pool, {
-        idempotencyKey, jobType: 'restore', problemId: externalId, targetGeneration: body.generation ?? null, leaseOwner: getAuth(req).sub,
-        requestFingerprint: db.stableFingerprint({ action: 'restore', external_id: externalId, generation: body.generation ?? null }),
+        idempotencyKey, jobType: 'restore', problemId: externalId, targetGeneration: generation, leaseOwner: getAuth(req).sub,
+        requestFingerprint: db.stableFingerprint({ action: 'restore', external_id: externalId, generation }),
       });
-      await audit(ctx, req, 'problem.restore', { problemId: externalId, generation: body.generation ?? null, jobId: job.id });
+      await audit(ctx, req, 'problem.restore', { problemId: externalId, generation, jobId: job.id });
       reply.code(202).send(accepted(job));
     } catch (err) {
       sendJobError(reply, err, getRequestId(req));

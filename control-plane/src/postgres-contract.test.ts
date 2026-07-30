@@ -27,6 +27,7 @@ describe.runIf(enabled)('PostgreSQL concurrency contracts', () => {
       '004_idempotency_dirty_contract.sql',
       '005_dashboard_users.sql',
       '006_problem_identity_rekey.sql',
+      '007_active_job_guards.sql',
     ]) {
       await pool.query(readFileSync(resolve(__dirname, `../../migrations/${name}`), 'utf8'));
     }
@@ -171,5 +172,147 @@ describe.runIf(enabled)('PostgreSQL concurrency contracts', () => {
     const scheduledIds = scheduled.map((item) => item.problem_id);
     expect(scheduledIds).toContain('p-present');
     expect(scheduledIds).not.toContain('p-missing');
+  });
+
+  it('fences late missing observations after one restore has completed', async () => {
+    await pool.query(
+      `INSERT INTO problems (external_id, code, catalog_state)
+       VALUES ('p-late-restore', 'late-restore', 'present')`,
+    );
+    const missingObservedAt = '2026-07-31T00:00:00.000Z';
+    await pool.query(
+      `INSERT INTO problem_usage
+         (problem_id, local_status, r2_status, snapshot_generation, observed_at, stale)
+       VALUES ('p-late-restore', 'missing', 'ready', 9, $1, false)`,
+      [missingObservedAt],
+    );
+    const fingerprint = db.stableFingerprint({
+      action: 'ensure-ready-restore',
+      external_id: 'p-late-restore',
+      generation: 9,
+    });
+
+    const firstWave = await Promise.all(
+      Array.from({ length: 50 }, (_, index) => db.createRestoreJobIfMissing(pool, {
+        idempotencyKey: `late-first-${index}`,
+        problemId: 'p-late-restore',
+        targetGeneration: 9,
+        leaseOwner: 'stress',
+        requestFingerprint: fingerprint,
+        missingObservedAt,
+      })),
+    );
+    const firstJobs = firstWave.filter((result) => !result.ready).map((result) => result.job.id);
+    expect(new Set(firstJobs).size).toBe(1);
+
+    await pool.query(
+      `UPDATE jobs
+       SET state = 'completed', completed_at = '2026-07-31T00:00:01.000Z'
+       WHERE id = $1`,
+      [firstJobs[0]],
+    );
+    await pool.query(
+      `UPDATE problem_usage
+       SET local_status = 'present', observed_at = '2026-07-31T00:00:01.000Z'
+       WHERE problem_id = 'p-late-restore'`,
+    );
+
+    const lateWave = await Promise.all(
+      Array.from({ length: 50 }, (_, index) => db.createRestoreJobIfMissing(pool, {
+        idempotencyKey: `late-second-${index}`,
+        problemId: 'p-late-restore',
+        targetGeneration: 9,
+        leaseOwner: 'stress',
+        requestFingerprint: fingerprint,
+        missingObservedAt,
+      })),
+    );
+    expect(lateWave.every((result) => result.ready)).toBe(true);
+    const count = await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM jobs
+       WHERE problem_id = 'p-late-restore' AND job_type = 'restore'`,
+    );
+    expect(count.rows[0].count).toBe(1);
+
+    const newDeletion = await db.createRestoreJobIfMissing(pool, {
+      idempotencyKey: 'late-real-deletion',
+      problemId: 'p-late-restore',
+      targetGeneration: 9,
+      leaseOwner: 'stress',
+      requestFingerprint: fingerprint,
+      missingObservedAt: '2026-07-31T00:00:02.000Z',
+    });
+    expect(newDeletion.ready).toBe(false);
+    const afterDeletion = await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM jobs
+       WHERE problem_id = 'p-late-restore' AND job_type = 'restore'`,
+    );
+    expect(afterDeletion.rows[0].count).toBe(2);
+  });
+
+  it('serializes incompatible jobs and allows only one running local operation per problem', async () => {
+    await pool.query(
+      `INSERT INTO problems (external_id, code, catalog_state)
+       VALUES ('p-operation-wall', 'operation-wall', 'present')`,
+    );
+    await db.createJob(pool, {
+      idempotencyKey: 'operation-scan',
+      jobType: 'scan',
+      problemId: 'p-operation-wall',
+      targetGeneration: null,
+      leaseOwner: 'stress',
+      requestFingerprint: db.stableFingerprint({ action: 'scan', external_id: 'p-operation-wall' }),
+    });
+    await db.createJob(pool, {
+      idempotencyKey: 'operation-snapshot',
+      jobType: 'snapshot',
+      problemId: 'p-operation-wall',
+      targetGeneration: 1,
+      leaseOwner: 'stress',
+      requestFingerprint: db.stableFingerprint({
+        action: 'snapshot',
+        external_id: 'p-operation-wall',
+        generation: 1,
+      }),
+    });
+    await expect(db.createJob(pool, {
+      idempotencyKey: 'operation-restore',
+      jobType: 'restore',
+      problemId: 'p-operation-wall',
+      targetGeneration: 1,
+      leaseOwner: 'stress',
+      requestFingerprint: db.stableFingerprint({
+        action: 'restore',
+        external_id: 'p-operation-wall',
+        generation: 1,
+      }),
+    })).rejects.toBeInstanceOf(db.ProblemOperationConflictError);
+
+    const active = await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM jobs
+       WHERE problem_id = 'p-operation-wall' AND state IN ('pending', 'running')`,
+    );
+    expect(active.rows[0].count).toBe(2);
+
+    await pool.query(
+      `UPDATE jobs
+       SET state = 'completed', completed_at = now()
+       WHERE problem_id <> 'p-operation-wall'
+         AND state IN ('pending', 'running')`,
+    );
+    const acquired = await Promise.all([
+      db.acquireJob(pool, 'worker-a', 60),
+      db.acquireJob(pool, 'worker-b', 60),
+    ]);
+    expect(acquired.filter((job) => job?.problem_id === 'p-operation-wall')).toHaveLength(1);
+    const running = await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM jobs
+       WHERE problem_id = 'p-operation-wall' AND state = 'running'`,
+    );
+    expect(running.rows[0].count).toBe(1);
   });
 });
