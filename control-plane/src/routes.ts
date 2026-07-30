@@ -309,7 +309,7 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
       const mountPath = ctx.env.problemRootContainer || '/problems';
       await db.upsertVolume(ctx.pool, volName, mountPath, vol.total_bytes, vol.free_bytes, vol.available_bytes);
       reply.send({ items: [{ name: volName, mount_path: mountPath, ...vol }], next_cursor: null, has_more: false });
-    } catch (err) {
+    } catch {
       const v = await db.getVolume(ctx.pool);
       if (v) reply.send({ items: [v], next_cursor: null, has_more: false });
       else reply.code(503).send({ code: 'rust_unavailable', message: 'Rust data plane unavailable and no cached volume data', retryable: true, request_id: getRequestId(req) });
