@@ -1,6 +1,6 @@
 use rust_data_plane::paths::{
     safe_destination_under_root, safe_join, safe_problem_folder, validate_content_object_key,
-    validate_relative_path,
+    validate_managed_object_key, validate_relative_path,
 };
 use rust_data_plane::scanner::{
     canonical_download_path_from_folder, list_problem_codes, scan_problem_folder, scan_volume,
@@ -134,6 +134,14 @@ fn test_problem_code_path_escape_rejected() {
     )
     .is_ok());
     assert!(validate_content_object_key("snapshots/p1/1/manifest.json").is_err());
+    assert!(validate_managed_object_key(
+        "objects/sha256/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+    .is_ok());
+    assert!(validate_managed_object_key("snapshots/p1/1/manifest.json").is_ok());
+    assert!(validate_managed_object_key("snapshots/../1/manifest.json").is_err());
+    assert!(validate_managed_object_key("snapshots/p1/-1/manifest.json").is_err());
+    assert!(validate_managed_object_key("unmanaged/file").is_err());
 }
 
 #[test]

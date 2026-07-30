@@ -35,7 +35,7 @@ pub enum AppError {
     SpecialFile(String),
     #[error("manifest integrity error: {0}")]
     ManifestIntegrity(String),
-    #[error("object still referenced by READY snapshots: {0}")]
+    #[error("object still referenced by a retention-protected snapshot: {0}")]
     ObjectLiveReference(String),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),

@@ -28,7 +28,23 @@ describe.runIf(enabled)('PostgreSQL concurrency contracts', () => {
       '005_dashboard_users.sql',
       '006_problem_identity_rekey.sql',
       '007_active_job_guards.sql',
+      '008_snapshot_retention_gc.sql',
     ]) {
+      if (name === '008_snapshot_retention_gc.sql') {
+        await pool.query(
+          `INSERT INTO problems (external_id, code, catalog_state)
+           VALUES ('p-legacy-ready', 'legacy-ready', 'present')`,
+        );
+        await pool.query(
+          `INSERT INTO snapshots
+             (problem_id, generation, state, manifest_key, completed_at)
+           VALUES
+             ('p-legacy-ready', 1, 'ready', 'snapshots/p-legacy-ready/1/manifest.json',
+              now() - interval '1 day'),
+             ('p-legacy-ready', 2, 'ready', 'snapshots/p-legacy-ready/2/manifest.json',
+              now())`,
+        );
+      }
       await pool.query(readFileSync(resolve(__dirname, `../../migrations/${name}`), 'utf8'));
     }
   }, 30000);
@@ -104,6 +120,23 @@ describe.runIf(enabled)('PostgreSQL concurrency contracts', () => {
       leaseOwner: 'test',
       requestFingerprint: 'same-restore',
     })).rejects.toBeInstanceOf(db.IdempotencyConflictError);
+  });
+
+  it('repairs legacy duplicate READY generations and enforces one authoritative snapshot', async () => {
+    const rows = await pool.query(
+      `SELECT generation, state, superseded_at IS NOT NULL AS has_superseded_at
+       FROM snapshots
+       WHERE problem_id = 'p-legacy-ready'
+       ORDER BY generation`,
+    );
+    expect(rows.rows).toEqual([
+      { generation: 1, state: 'superseded', has_superseded_at: true },
+      { generation: 2, state: 'ready', has_superseded_at: false },
+    ]);
+    await expect(pool.query(
+      `INSERT INTO snapshots (problem_id, generation, state)
+       VALUES ('p-legacy-ready', 3, 'ready')`,
+    )).rejects.toMatchObject({ code: '23505' });
   });
 
   it('merges watcher orphan accounting when a catalog problem is renamed', async () => {
@@ -314,5 +347,156 @@ describe.runIf(enabled)('PostgreSQL concurrency contracts', () => {
        WHERE problem_id = 'p-operation-wall' AND state = 'running'`,
     );
     expect(running.rows[0].count).toBe(1);
+  });
+
+  it('retains shared objects, sweeps private objects, and prunes metadata only after collection', async () => {
+    await pool.query(
+      `INSERT INTO problems (external_id, code, catalog_state)
+       VALUES ('p-retention', 'retention-code', 'present')`,
+    );
+    await pool.query(
+      `INSERT INTO problem_usage
+         (problem_id, local_status, r2_status, snapshot_generation, observed_at, stale)
+       VALUES ('p-retention', 'present', 'ready', 2, now(), false)`,
+    );
+    const snapshots = await pool.query(
+      `INSERT INTO snapshots
+         (problem_id, generation, state, manifest_key, completed_at, superseded_at)
+       VALUES
+         ('p-retention', 1, 'superseded', 'snapshots/p-retention/1/manifest.json',
+          now() - interval '100 days', now() - interval '100 days'),
+         ('p-retention', 2, 'ready', 'snapshots/p-retention/2/manifest.json',
+          now(), NULL)
+       RETURNING id, generation`,
+    );
+    const oldId = snapshots.rows.find((row) => row.generation === 1).id;
+    const readyId = snapshots.rows.find((row) => row.generation === 2).id;
+    const sharedSha = 'a'.repeat(64);
+    const privateSha = 'b'.repeat(64);
+    const sharedKey = `objects/sha256/aa/${sharedSha}`;
+    const privateKey = `objects/sha256/bb/${privateSha}`;
+    await pool.query(
+      `INSERT INTO snapshot_objects
+         (snapshot_id, sha256, rel_path, size_bytes, object_key, uploaded, verified)
+       VALUES
+         ($1, $3, 'shared-old.zip', 10, $5, true, true),
+         ($1, $4, 'private.zip', 20, $6, true, true),
+         ($2, $3, 'shared-ready.zip', 10, $5, true, true)`,
+      [oldId, readyId, sharedSha, privateSha, sharedKey, privateKey],
+    );
+
+    const first = await db.applyRetention(pool);
+    expect(first.gc_marks).toBe(2);
+    expect(first.snapshots_pruned).toBe(0);
+    const marks = await pool.query(
+      `SELECT object_key, object_kind, collected
+       FROM gc_marks
+       WHERE snapshot_id = $1
+       ORDER BY object_key`,
+      [oldId],
+    );
+    expect(marks.rows.map((row) => row.object_key)).toEqual([
+      privateKey,
+      'snapshots/p-retention/1/manifest.json',
+    ]);
+    expect(marks.rows.some((row) => row.object_key === sharedKey)).toBe(false);
+    expect(await db.listGcEligible(pool, 10)).toHaveLength(0);
+
+    await pool.query(
+      `UPDATE gc_marks SET eligible_at = now() - interval '1 second'
+       WHERE snapshot_id = $1`,
+      [oldId],
+    );
+    const eligible = await db.listGcEligible(pool, 10);
+    expect(new Set(eligible.map((item) => item.object_key))).toEqual(new Set([
+      privateKey,
+      'snapshots/p-retention/1/manifest.json',
+    ]));
+    await db.markGcCollected(pool, eligible.map((item) => item.id));
+
+    const second = await db.applyRetention(pool);
+    expect(second.snapshots_pruned).toBe(1);
+    const remaining = await pool.query(
+      `SELECT generation, state FROM snapshots
+       WHERE problem_id = 'p-retention' ORDER BY generation`,
+    );
+    expect(remaining.rows).toEqual([{ generation: 2, state: 'ready' }]);
+    expect(await pool.query(
+      `SELECT 1 FROM gc_marks WHERE object_key = $1`,
+      [sharedKey],
+    )).toMatchObject({ rowCount: 0 });
+  });
+
+  it('coalesces concurrent global GC jobs', async () => {
+    const jobs = await Promise.all(
+      Array.from({ length: 25 }, (_, index) => db.createJob(pool, {
+        idempotencyKey: `gc-wave-${index}`,
+        jobType: 'gc_collect',
+        problemId: null,
+        targetGeneration: null,
+        leaseOwner: 'test',
+        requestFingerprint: `gc-fingerprint-${index}`,
+      })),
+    );
+    expect(new Set(jobs.map((job) => job.id)).size).toBe(1);
+    const count = await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM jobs
+       WHERE job_type = 'gc_collect' AND state IN ('pending', 'running')`,
+    );
+    expect(count.rows[0].count).toBe(1);
+  });
+
+  it('treats superseded generations inside the rollback window as live references', async () => {
+    await pool.query(
+      `INSERT INTO problems (external_id, code, catalog_state)
+       VALUES ('p-rollback', 'rollback-code', 'present')`,
+    );
+    const snapshots = await pool.query(
+      `INSERT INTO snapshots
+         (problem_id, generation, state, manifest_key, completed_at, superseded_at)
+       VALUES
+         ('p-rollback', 1, 'superseded', 'snapshots/p-rollback/1/manifest.json',
+          now() - interval '120 days', now() - interval '120 days'),
+         ('p-rollback', 2, 'superseded', 'snapshots/p-rollback/2/manifest.json',
+          now() - interval '1 day', now() - interval '1 day'),
+         ('p-rollback', 3, 'ready', 'snapshots/p-rollback/3/manifest.json',
+          now(), NULL)
+       RETURNING id, generation`,
+    );
+    const oldId = snapshots.rows.find((row) => row.generation === 1).id;
+    const protectedId = snapshots.rows.find((row) => row.generation === 2).id;
+    const sharedSha = 'c'.repeat(64);
+    const sharedKey = `objects/sha256/cc/${sharedSha}`;
+    await pool.query(
+      `INSERT INTO snapshot_objects
+         (snapshot_id, sha256, rel_path, size_bytes, object_key, uploaded, verified)
+       VALUES
+         ($1, $3, 'old-shared.zip', 10, $4, true, true),
+         ($2, $3, 'protected-shared.zip', 10, $4, true, true)`,
+      [oldId, protectedId, sharedSha, sharedKey],
+    );
+
+    await db.applyRetention(pool);
+    const mark = await pool.query(
+      `SELECT 1 FROM gc_marks WHERE object_key = $1`,
+      [sharedKey],
+    );
+    expect(mark.rowCount).toBe(0);
+
+    await pool.query(
+      `UPDATE snapshots SET superseded_at = now() - interval '120 days'
+       WHERE id = $1`,
+      [protectedId],
+    );
+    await db.applyRetention(pool);
+    const expiredMark = await pool.query(
+      `SELECT snapshot_id, eligible_at > now() AS has_safety_window
+       FROM gc_marks WHERE object_key = $1`,
+      [sharedKey],
+    );
+    expect(expiredMark.rows).toHaveLength(1);
+    expect(expiredMark.rows[0].snapshot_id).toBe(protectedId);
+    expect(expiredMark.rows[0].has_safety_window).toBe(true);
   });
 });

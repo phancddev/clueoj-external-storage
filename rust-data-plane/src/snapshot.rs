@@ -91,7 +91,7 @@ impl SnapshotManager {
         // A failed attempt must be retryable with the same generation. Reuse
         // only an error row; active, ready, and superseded generations remain
         // immutable and continue to reject concurrent writers.
-        let snapshot_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        let snapshot_row = sqlx::query_as::<_, (uuid::Uuid, chrono::DateTime<chrono::Utc>)>(
             r#"INSERT INTO snapshots (id, problem_id, generation, state, file_count, total_bytes, created_at)
                VALUES ($1, $2, $3, 'discovered', 0, 0, $4)
                ON CONFLICT (problem_id, generation) DO UPDATE SET
@@ -101,10 +101,9 @@ impl SnapshotManager {
                    manifest_key = NULL,
                    error_code = NULL,
                    error_message = NULL,
-                   created_at = EXCLUDED.created_at,
                    completed_at = NULL
                WHERE snapshots.state = 'error'
-               RETURNING snapshots.id"#,
+               RETURNING snapshots.id, snapshots.created_at"#,
         )
         .bind(requested_snapshot_id)
         .bind(problem_id)
@@ -112,7 +111,7 @@ impl SnapshotManager {
         .bind(now)
         .fetch_optional(&self.db)
         .await?;
-        let Some(snapshot_id) = snapshot_id else {
+        let Some((snapshot_id, created_at)) = snapshot_row else {
             return Err(AppError::Internal(format!(
                 "snapshot generation {generation} already exists for problem {problem_id}"
             )));
@@ -133,7 +132,7 @@ impl SnapshotManager {
                 expected_dirty_version,
                 problem_root,
                 scan,
-                now,
+                created_at,
             )
             .await;
         if let Err(e) = &result {
@@ -160,6 +159,7 @@ impl SnapshotManager {
             .await?;
 
         let folder = paths::safe_problem_folder(problem_root, &scan.code)?;
+        let mkey = manifest_key(problem_id, generation);
         let canonical_download_path =
             scanner::canonical_download_path_from_folder(&folder, &scan.files).ok_or_else(
                 || {
@@ -169,19 +169,17 @@ impl SnapshotManager {
                     )
                 },
             )?;
-        sqlx::query(
-            r#"UPDATE snapshots SET state = 'uploading' WHERE id = $1 AND state = 'hashing'"#,
-        )
-        .bind(snapshot_id)
-        .execute(&self.db)
-        .await?;
+        self.prepare_snapshot_upload(snapshot_id, problem_id, scan, &mkey)
+            .await?;
 
         let store = self.store.clone();
+        let db = self.db.clone();
         let mut manifest_files: Vec<ManifestFile> = stream::iter(scan.files.clone())
             .map(|file| {
                 let store = store.clone();
                 let folder = folder.clone();
-                async move { upload_manifest_file(store, folder, file).await }
+                let db = db.clone();
+                async move { upload_manifest_file(db, snapshot_id, store, folder, file).await }
             })
             .buffer_unordered(self.max_concurrent_uploads)
             .try_collect()
@@ -213,7 +211,6 @@ impl SnapshotManager {
         };
         let manifest_json = serde_json::to_vec(&manifest)?;
         let manifest_sha = crate::hasher::sha256_bytes(&manifest_json);
-        let mkey = manifest_key(problem_id, generation);
         self.store
             .put_object(&mkey, manifest_json, &manifest_sha)
             .await?;
@@ -249,6 +246,90 @@ impl SnapshotManager {
             created_at: now,
             completed_at: Some(chrono::Utc::now()),
         })
+    }
+
+    async fn prepare_snapshot_upload(
+        &self,
+        snapshot_id: uuid::Uuid,
+        problem_id: &str,
+        scan: &ScanResult,
+        manifest_key: &str,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin().await?;
+        // Serialize claim creation with retention candidate selection. The
+        // snapshot is already in an active state, so maintenance will skip it;
+        // this lock closes the remaining mark-after-claim race.
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('snapshot-retention:apply', 2907))",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 2907))")
+            .bind(problem_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let mut object_keys: Vec<String> = scan
+            .files
+            .iter()
+            .map(|file| object_key_for_sha256(&file.sha256))
+            .collect();
+        object_keys.push(manifest_key.to_string());
+        object_keys.sort_unstable();
+        object_keys.dedup();
+        for key in &object_keys {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 2907))")
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
+        }
+        // A content-addressed key may have been collected in an earlier
+        // lifecycle and then uploaded again. Once this snapshot claims it,
+        // any historical GC mark must be discarded and recreated only after
+        // the new snapshot's retention window expires.
+        sqlx::query("DELETE FROM gc_marks WHERE object_key = ANY($1)")
+            .bind(&object_keys)
+            .execute(&mut *tx)
+            .await?;
+
+        let uploading = sqlx::query(
+            r#"UPDATE snapshots
+               SET state = 'uploading', manifest_key = $2
+               WHERE id = $1 AND state = 'hashing'"#,
+        )
+        .bind(snapshot_id)
+        .bind(manifest_key)
+        .execute(&mut *tx)
+        .await?;
+        if uploading.rows_affected() != 1 {
+            return Err(AppError::Internal(
+                "snapshot upload preparation CAS failed".to_string(),
+            ));
+        }
+
+        for file in &scan.files {
+            sqlx::query(
+                r#"INSERT INTO snapshot_objects
+                     (snapshot_id, sha256, rel_path, size_bytes, object_key, uploaded, verified)
+                   VALUES ($1, $2, $3, $4, $5, false, false)
+                   ON CONFLICT (snapshot_id, rel_path) DO UPDATE SET
+                     sha256 = EXCLUDED.sha256,
+                     size_bytes = EXCLUDED.size_bytes,
+                     object_key = EXCLUDED.object_key,
+                     uploaded = false,
+                     verified = false"#,
+            )
+            .bind(snapshot_id)
+            .bind(&file.sha256)
+            .bind(&file.path)
+            .bind(file.size as i64)
+            .bind(object_key_for_sha256(&file.sha256))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn mark_snapshot_error(&self, snapshot_id: uuid::Uuid, err: &AppError) -> AppResult<()> {
@@ -299,19 +380,6 @@ impl SnapshotManager {
             .execute(&mut *tx)
             .await?;
         ensure_latest_fencing_tx(&mut tx, problem_id, fencing_token).await?;
-        let mut object_keys: Vec<&str> = manifest_files
-            .iter()
-            .map(|f| f.object_key.as_str())
-            .collect();
-        object_keys.sort_unstable();
-        object_keys.dedup();
-        for key in object_keys {
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 2907))")
-                .bind(key)
-                .execute(&mut *tx)
-                .await?;
-        }
-
         let current: Option<i64> = sqlx::query_scalar(
             r#"SELECT snapshot_generation::BIGINT FROM problem_usage WHERE problem_id = $1 FOR UPDATE"#,
         )
@@ -327,6 +395,16 @@ impl SnapshotManager {
                 });
             }
         }
+
+        sqlx::query(
+            r#"UPDATE snapshots
+               SET state = 'superseded', superseded_at = now()
+               WHERE problem_id = $1 AND state = 'ready' AND generation < $2"#,
+        )
+        .bind(problem_id)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
 
         let ready = sqlx::query(
             r#"UPDATE snapshots
@@ -368,16 +446,6 @@ impl SnapshotManager {
             .execute(&mut *tx)
             .await?;
         }
-
-        sqlx::query(
-            r#"UPDATE snapshots
-               SET state = 'superseded'
-               WHERE problem_id = $1 AND state = 'ready' AND generation < $2"#,
-        )
-        .bind(problem_id)
-        .bind(generation)
-        .execute(&mut *tx)
-        .await?;
 
         let usage = sqlx::query(
             r#"UPDATE problem_usage
@@ -685,7 +753,7 @@ impl SnapshotManager {
     }
 
     pub async fn delete_object(&self, object_key: &str, fencing_token: i64) -> AppResult<bool> {
-        paths::validate_content_object_key(object_key)?;
+        paths::validate_managed_object_key(object_key)?;
         let mut conn = self.db.acquire().await?;
         sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 2907))")
             .bind(object_key)
@@ -707,14 +775,17 @@ impl SnapshotManager {
         object_key: &str,
         fencing_token: i64,
     ) -> AppResult<bool> {
-        ensure_no_live_refs_conn(conn, object_key, fencing_token).await?;
+        ensure_current_gc_fencing_conn(conn, fencing_token).await?;
+        ensure_no_live_refs_conn(conn, object_key).await?;
         let meta = self.store.head_object(object_key).await?;
         if !meta.exists {
             return Ok(false);
         }
-        ensure_no_live_refs_conn(conn, object_key, fencing_token).await?;
+        ensure_current_gc_fencing_conn(conn, fencing_token).await?;
+        ensure_no_live_refs_conn(conn, object_key).await?;
         self.store.delete_object(object_key).await?;
-        ensure_no_live_refs_conn(conn, object_key, fencing_token).await?;
+        ensure_current_gc_fencing_conn(conn, fencing_token).await?;
+        ensure_no_live_refs_conn(conn, object_key).await?;
         Ok(true)
     }
 }
@@ -860,6 +931,8 @@ pub async fn presign_canonical_from_manifest(
 }
 
 async fn upload_manifest_file(
+    db: PgPool,
+    snapshot_id: uuid::Uuid,
     store: Arc<dyn ObjectStore>,
     folder: std::path::PathBuf,
     file: crate::models::FileEntry,
@@ -892,6 +965,25 @@ async fn upload_manifest_file(
                 got: "uploaded object verification failed".to_string(),
             });
         }
+    }
+    let updated = sqlx::query(
+        r#"UPDATE snapshot_objects
+           SET sha256 = $3, size_bytes = $4, object_key = $5,
+               uploaded = true, verified = true
+           WHERE snapshot_id = $1 AND rel_path = $2"#,
+    )
+    .bind(snapshot_id)
+    .bind(&file.path)
+    .bind(&stable_sha)
+    .bind(file.size as i64)
+    .bind(&object_key)
+    .execute(&db)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::Internal(format!(
+            "snapshot object claim missing for {}",
+            file.path
+        )));
     }
     Ok(ManifestFile {
         path: file.path,
@@ -929,36 +1021,28 @@ async fn ensure_latest_fencing_tx(
 async fn ensure_no_live_refs_conn(
     conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
     object_key: &str,
-    fencing_token: i64,
 ) -> AppResult<()> {
-    let refs = sqlx::query_as::<_, LiveObjectRef>(
-        r#"SELECT DISTINCT s.problem_id
+    let refs: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(DISTINCT s.id)
            FROM snapshot_objects so
            JOIN snapshots s ON s.id = so.snapshot_id
-           WHERE so.object_key = $1 AND s.state = 'ready'"#,
+           WHERE so.object_key = $1
+             AND snapshot_is_gc_protected(
+               s.state, s.superseded_at, s.completed_at
+             )"#,
     )
     .bind(object_key)
-    .fetch_all(&mut **conn)
+    .fetch_one(&mut **conn)
     .await?;
-    for r in &refs {
-        let latest: Option<i64> =
-            sqlx::query_scalar(r#"SELECT MAX(fencing_token) FROM jobs WHERE problem_id = $1"#)
-                .bind(&r.problem_id)
-                .fetch_optional(&mut **conn)
-                .await?;
-        if latest.unwrap_or(0) > fencing_token {
-            return Err(AppError::FencingMismatch {
-                expected: fencing_token,
-                got: latest.unwrap_or(0),
-            });
-        }
-    }
-    if !refs.is_empty() {
+    if refs > 0 {
         return Err(AppError::ObjectLiveReference(object_key.to_string()));
     }
     let manifest_refs: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*) FROM snapshots
-           WHERE manifest_key = $1 AND state = 'ready'"#,
+           WHERE manifest_key = $1
+             AND snapshot_is_gc_protected(
+               state, superseded_at, completed_at
+             )"#,
     )
     .bind(object_key)
     .fetch_one(&mut **conn)
@@ -969,9 +1053,24 @@ async fn ensure_no_live_refs_conn(
     Ok(())
 }
 
-#[derive(sqlx::FromRow)]
-struct LiveObjectRef {
-    problem_id: String,
+async fn ensure_current_gc_fencing_conn(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    fencing_token: i64,
+) -> AppResult<()> {
+    let latest: Option<i64> = sqlx::query_scalar(
+        r#"SELECT MAX(fencing_token)
+           FROM jobs
+           WHERE problem_id IS NULL AND job_type = 'gc_collect'"#,
+    )
+    .fetch_optional(&mut **conn)
+    .await?;
+    if latest.unwrap_or(0) > fencing_token {
+        return Err(AppError::FencingMismatch {
+            expected: fencing_token,
+            got: latest.unwrap_or(0),
+        });
+    }
+    Ok(())
 }
 
 fn error_code(err: &AppError) -> &'static str {

@@ -71,3 +71,27 @@ pub fn validate_content_object_key(key: &str) -> AppResult<()> {
     }
     Ok(())
 }
+
+pub fn validate_managed_object_key(key: &str) -> AppResult<()> {
+    if key.starts_with("objects/sha256/") {
+        return validate_content_object_key(key);
+    }
+
+    let parts: Vec<&str> = key.split('/').collect();
+    let valid_manifest = parts.len() == 4
+        && parts[0] == "snapshots"
+        && !parts[1].is_empty()
+        && parts[1] != "."
+        && parts[1] != ".."
+        && parts[1]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        && parts[2]
+            .parse::<i64>()
+            .is_ok_and(|generation| generation > 0)
+        && parts[3] == "manifest.json";
+    if !valid_manifest {
+        return Err(AppError::PathEscape(key.to_string()));
+    }
+    Ok(())
+}

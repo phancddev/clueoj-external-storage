@@ -10,6 +10,7 @@ import { RustClient } from './rust-client.js';
 import { buildRoutes, type AppContext } from './routes.js';
 import { logger } from './logger.js';
 import { JobWorker } from './worker.js';
+import { MaintenanceScheduler } from './maintenance.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -100,11 +101,14 @@ async function main(): Promise<void> {
 
   await buildRoutes(app, ctx);
   const worker = env.workerEnabled ? new JobWorker(ctx) : null;
+  const maintenance = env.workerEnabled ? new MaintenanceScheduler(pool) : null;
   worker?.start();
+  maintenance?.start();
 
   // Graceful shutdown
   const shutdown = async (sig: string) => {
     logger.info({ sig }, 'Shutting down');
+    await maintenance?.stop();
     await worker?.stop();
     await app.close();
     await pool.end();

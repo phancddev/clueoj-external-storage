@@ -1,6 +1,6 @@
 import type { Pool } from 'pg';
 import type { Env } from './env.js';
-import type { RustClient } from './rust-client.js';
+import { RustClient, RustError } from './rust-client.js';
 import * as db from './db.js';
 import { logger } from './logger.js';
 import type { JobT } from './schemas.js';
@@ -228,15 +228,30 @@ export class JobWorker {
 
   private async gcCollect(job: JobT, guard: () => Promise<void>): Promise<unknown> {
     const opts = (job.result ?? {}) as { limit?: number };
-    const objects = await db.listGcEligible(this.ctx.pool, Math.min(opts.limit ?? 100, 500));
-    const collected: string[] = [];
+    const requestedLimit = Number(opts.limit ?? 100);
+    const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 500)
+      : 100;
+    const objects = await db.listGcEligible(this.ctx.pool, limit);
+    let collected = 0;
+    let deferred = 0;
     for (const object of objects) {
       await guard();
-      await this.ctx.rust.deleteObject(object.object_key, job.fencing_token);
-      collected.push(object.id);
+      try {
+        await this.ctx.rust.deleteObject(object.object_key, job.fencing_token);
+        await guard();
+        collected += await db.markGcCollected(this.ctx.pool, [object.id]);
+      } catch (err) {
+        if (isLiveReferenceError(err)) {
+          await db.deferGcMark(this.ctx.pool, object.id, errorMessage(err));
+          deferred++;
+          continue;
+        }
+        await db.recordGcFailure(this.ctx.pool, object.id, errorMessage(err));
+        throw err;
+      }
     }
-    await db.markGcCollected(this.ctx.pool, collected);
-    return { collected: collected.length };
+    return { collected, deferred, examined: objects.length };
   }
 
   private async incidentCommand(job: JobT): Promise<unknown> {
@@ -249,6 +264,16 @@ export class JobWorker {
 function errorCode(err: unknown): string {
   if (err instanceof Error && err.message.includes('Unsupported')) return 'unsupported_job';
   return 'job_failed';
+}
+
+function isLiveReferenceError(err: unknown): boolean {
+  return err instanceof RustError
+    && err.statusCode === 409
+    && err.body.includes('"code":"OBJECT_LIVE_REFERENCE"');
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function sleep(ms: number): Promise<void> {

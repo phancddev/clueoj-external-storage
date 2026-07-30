@@ -858,6 +858,11 @@ function isActiveProblemOperationConstraint(err: unknown): boolean {
   );
 }
 
+function isActiveGcConstraint(err: unknown): boolean {
+  const pg = err as { code?: string; constraint?: string };
+  return pg?.code === '23505' && pg?.constraint === 'idx_jobs_one_active_gc_collect';
+}
+
 export async function createJob(
   pool: JobQueryable, opts: {
     idempotencyKey: string; jobType: string; problemId: string | null;
@@ -916,7 +921,10 @@ export async function createJob(
          WHERE job_type = $2
            AND problem_id IS NOT DISTINCT FROM $3
            AND target_generation IS NOT DISTINCT FROM $4::integer
-           AND (request_fingerprint = $5 OR $2 = ANY(ARRAY['scan','snapshot','restore']))
+           AND (
+             request_fingerprint = $5
+             OR $2 = ANY(ARRAY['scan','snapshot','restore','gc_collect'])
+           )
            AND state IN ('pending', 'running')
            AND NOT EXISTS (SELECT 1 FROM replay)
            AND NOT EXISTS (SELECT 1 FROM key_conflict)
@@ -966,6 +974,17 @@ export async function createJob(
   } catch (err) {
     if (opts.problemId && isActiveProblemOperationConstraint(err)) {
       throw new ProblemOperationConflictError(opts.problemId);
+    }
+    if (opts.jobType === 'gc_collect' && isActiveGcConstraint(err)) {
+      const active = await pool.query(
+        `SELECT * FROM jobs
+         WHERE job_type = 'gc_collect'
+           AND problem_id IS NULL
+           AND state IN ('pending', 'running')
+         ORDER BY created_at ASC
+         LIMIT 1`,
+      );
+      if (active.rows[0]) return rowToJob(active.rows[0]);
     }
     throw err;
   }
@@ -1293,30 +1312,177 @@ export async function failExpiredRunningJobs(pool: Pool): Promise<number> {
 }
 
 export async function applyRetention(pool: Pool): Promise<Record<string, number>> {
-  const jobs = await pool.query(
-    `DELETE FROM jobs
-     WHERE completed_at < now() - ((SELECT retention_days FROM retention_config WHERE entity_type = 'jobs')::text || ' days')::interval`,
-  );
-  const audits = await pool.query(
-    `DELETE FROM audit_events
-     WHERE created_at < now() - ((SELECT retention_days FROM retention_config WHERE entity_type = 'audit_events')::text || ' days')::interval`,
-  );
-  const snapshots = await pool.query(
-    `UPDATE snapshots SET state = 'superseded'
-     WHERE state = 'ready'
-       AND completed_at < now() - ((SELECT retention_days FROM retention_config WHERE entity_type = 'superseded_snapshots')::text || ' days')::interval
-       AND EXISTS (
-         SELECT 1 FROM snapshots newer
-         WHERE newer.problem_id = snapshots.problem_id
-           AND newer.state = 'ready'
-           AND newer.generation > snapshots.generation
-       )`,
-  );
-  return {
-    jobs: jobs.rowCount ?? 0,
-    audit_events: audits.rowCount ?? 0,
-    superseded_snapshots: snapshots.rowCount ?? 0,
-  };
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended('snapshot-retention:apply', 2907))`,
+    );
+    const jobs = await client.query(
+      `DELETE FROM jobs
+       WHERE completed_at < now() - make_interval(days => (
+         SELECT retention_days FROM retention_config WHERE entity_type = 'jobs'
+       ))`,
+    );
+    const audits = await client.query(
+      `DELETE FROM audit_events
+       WHERE created_at < now() - make_interval(days => (
+         SELECT retention_days FROM retention_config WHERE entity_type = 'audit_events'
+       ))`,
+    );
+
+    // Metadata is pruned only after every private object was collected. Shared
+    // content may remain because a live snapshot still references it.
+    const pruned = await client.query(
+      `WITH expired AS (
+         SELECT s.*
+         FROM snapshots s
+         WHERE (
+           s.state = 'superseded'
+           AND s.superseded_at < now() - make_interval(days => (
+             SELECT retention_days FROM retention_config
+             WHERE entity_type = 'superseded_snapshots'
+           ))
+         ) OR (
+           s.state = 'error'
+           AND s.completed_at < now() - make_interval(days => (
+             SELECT retention_days FROM retention_config
+             WHERE entity_type = 'error_snapshots'
+           ))
+         )
+       )
+       DELETE FROM snapshots target
+       USING expired
+       WHERE target.id = expired.id
+         AND (
+           expired.manifest_key IS NULL
+           OR EXISTS (
+             SELECT 1 FROM gc_marks gm
+             WHERE gm.object_key = expired.manifest_key AND gm.collected
+           )
+           OR EXISTS (
+             SELECT 1 FROM snapshots live_manifest
+             WHERE live_manifest.id <> expired.id
+               AND live_manifest.manifest_key = expired.manifest_key
+               AND snapshot_is_gc_protected(
+                 live_manifest.state,
+                 live_manifest.superseded_at,
+                 live_manifest.completed_at
+               )
+           )
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM snapshot_objects old_object
+           WHERE old_object.snapshot_id = expired.id
+             AND NOT (
+               EXISTS (
+                 SELECT 1 FROM gc_marks gm
+                 WHERE gm.object_key = old_object.object_key AND gm.collected
+               )
+               OR EXISTS (
+                 SELECT 1
+                 FROM snapshot_objects live_object
+                 JOIN snapshots live_snapshot ON live_snapshot.id = live_object.snapshot_id
+                 WHERE live_object.object_key = old_object.object_key
+                   AND live_snapshot.id <> expired.id
+                   AND snapshot_is_gc_protected(
+                     live_snapshot.state,
+                     live_snapshot.superseded_at,
+                     live_snapshot.completed_at
+                   )
+               )
+             )
+         )`,
+    );
+
+    const marked = await client.query(
+      `WITH expired AS (
+         SELECT s.*
+         FROM snapshots s
+         WHERE (
+           s.state = 'superseded'
+           AND s.superseded_at < now() - make_interval(days => (
+             SELECT retention_days FROM retention_config
+             WHERE entity_type = 'superseded_snapshots'
+           ))
+         ) OR (
+           s.state = 'error'
+           AND s.completed_at < now() - make_interval(days => (
+             SELECT retention_days FROM retention_config
+             WHERE entity_type = 'error_snapshots'
+           ))
+         )
+       ), candidates AS (
+         SELECT old_object.sha256, old_object.object_key, expired.id AS snapshot_id,
+                'content'::text AS object_kind,
+                COALESCE(expired.superseded_at, expired.completed_at) AS retention_anchor
+         FROM expired
+         JOIN snapshot_objects old_object ON old_object.snapshot_id = expired.id
+         WHERE NOT EXISTS (
+           SELECT 1
+           FROM snapshot_objects live_object
+           JOIN snapshots live_snapshot ON live_snapshot.id = live_object.snapshot_id
+           WHERE live_object.object_key = old_object.object_key
+             AND snapshot_is_gc_protected(
+               live_snapshot.state,
+               live_snapshot.superseded_at,
+               live_snapshot.completed_at
+             )
+         )
+         UNION
+         SELECT 'manifest:' || expired.id::text, expired.manifest_key, expired.id,
+                'manifest'::text,
+                COALESCE(expired.superseded_at, expired.completed_at)
+         FROM expired
+         WHERE expired.manifest_key IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM snapshots live_manifest
+             WHERE live_manifest.manifest_key = expired.manifest_key
+               AND snapshot_is_gc_protected(
+                 live_manifest.state,
+                 live_manifest.superseded_at,
+                 live_manifest.completed_at
+               )
+           )
+       )
+       INSERT INTO gc_marks
+         (sha256, object_key, snapshot_id, object_kind, marked_at, eligible_at,
+          collected, collected_at, attempts, last_error)
+       SELECT DISTINCT ON (object_key)
+         sha256, object_key, snapshot_id, object_kind, now(),
+         now() + make_interval(days => (
+           SELECT retention_days FROM retention_config
+           WHERE entity_type = 'content_objects'
+         )),
+         false, NULL, 0, NULL
+       FROM candidates
+       ORDER BY object_key, retention_anchor DESC, snapshot_id
+       ON CONFLICT (sha256, object_key) DO UPDATE SET
+         snapshot_id = EXCLUDED.snapshot_id,
+         object_kind = EXCLUDED.object_kind,
+         marked_at = EXCLUDED.marked_at,
+         eligible_at = EXCLUDED.eligible_at,
+         collected = false,
+         collected_at = NULL,
+         attempts = 0,
+         last_error = NULL
+       WHERE (gc_marks.collected AND gc_marks.snapshot_id IS NULL)
+          OR gc_marks.snapshot_id IS DISTINCT FROM EXCLUDED.snapshot_id`,
+    );
+    await client.query('COMMIT');
+    return {
+      jobs: jobs.rowCount ?? 0,
+      audit_events: audits.rowCount ?? 0,
+      gc_marks: marked.rowCount ?? 0,
+      snapshots_pruned: pruned.rowCount ?? 0,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 export async function listGcEligible(pool: Pool, limit: number): Promise<Array<{ id: string; sha256: string; object_key: string }>> {
@@ -1328,9 +1494,13 @@ export async function listGcEligible(pool: Pool, limit: number): Promise<Array<{
        AND NOT EXISTS (
          SELECT 1 FROM snapshot_objects so
          JOIN snapshots s ON s.id = so.snapshot_id
-         WHERE so.sha256 = gm.sha256
-           AND so.object_key = gm.object_key
-           AND s.state IN ('ready', 'hashing', 'uploading', 'verifying')
+         WHERE so.object_key = gm.object_key
+           AND snapshot_is_gc_protected(s.state, s.superseded_at, s.completed_at)
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM snapshots s
+         WHERE s.manifest_key = gm.object_key
+           AND snapshot_is_gc_protected(s.state, s.superseded_at, s.completed_at)
        )
      ORDER BY gm.eligible_at ASC, gm.id ASC
      LIMIT $1`,
@@ -1347,6 +1517,35 @@ export async function markGcCollected(pool: Pool, ids: string[]): Promise<number
     [ids],
   );
   return rowCount ?? 0;
+}
+
+export async function deferGcMark(pool: Pool, id: string, error: string): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `UPDATE gc_marks
+     SET eligible_at = now() + make_interval(days => (
+           SELECT retention_days FROM retention_config
+           WHERE entity_type = 'content_objects'
+         )),
+         attempts = attempts + 1,
+         last_error = $2
+     WHERE id = $1 AND NOT collected`,
+    [id, error.slice(0, 1000)],
+  );
+  return (rowCount ?? 0) === 1;
+}
+
+export async function recordGcFailure(pool: Pool, id: string, error: string): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `UPDATE gc_marks
+     SET eligible_at = now() + make_interval(
+           secs => LEAST(86400, 60 * power(2, LEAST(attempts, 10))::integer)
+         ),
+         attempts = attempts + 1,
+         last_error = $2
+     WHERE id = $1 AND NOT collected`,
+    [id, error.slice(0, 1000)],
+  );
+  return (rowCount ?? 0) === 1;
 }
 
 export async function cancelJob(pool: Pool, id: string, reason: string | null): Promise<JobT | null> {
