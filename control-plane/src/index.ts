@@ -77,7 +77,16 @@ async function main(): Promise<void> {
       prefix: '/',
       wildcard: false,
     });
-    app.setNotFoundHandler(async (_req, reply) => {
+    app.setNotFoundHandler(async (req, reply) => {
+      const path = req.url.split('?')[0];
+      if (path.startsWith('/api/')) {
+        return reply.code(404).type('application/json').send({
+          code: 'not_found',
+          message: 'API endpoint not found',
+          retryable: false,
+          request_id: req.id,
+        });
+      }
       try {
         const index = readFileSync(resolve(dashboardPath, 'index.html'));
         reply.type('text/html').send(index);
