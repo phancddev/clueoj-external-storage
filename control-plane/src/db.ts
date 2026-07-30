@@ -22,6 +22,12 @@ export class CatalogCodeConflictError extends Error {
     this.name = 'CatalogCodeConflictError';
   }
 }
+export class OrphanHistoryConflictError extends Error {
+  constructor(code: string) {
+    super(`Orphan ${code} has immutable history and cannot be merged automatically`);
+    this.name = 'OrphanHistoryConflictError';
+  }
+}
 
 function encodeCursor(value: unknown): string {
   return Buffer.from(JSON.stringify(value)).toString('base64url');
@@ -50,24 +56,109 @@ export async function upsertProblem(
   isManuallyManaged: boolean, mirrorOf: string | null, mirrorRoot: string | null,
   quotaBytes: number | string | null = null, schemaVersion = 1,
 ): Promise<ProblemT> {
-  const { rows } = await pool.query(
-    `INSERT INTO problems (external_id, code, owner_organization, is_manually_managed, mirror_of, mirror_root, quota_bytes, schema_version, catalog_state, observed_at, stale)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'present', now(), false)
-     ON CONFLICT (external_id) DO UPDATE SET
-       code = EXCLUDED.code,
-       owner_organization = EXCLUDED.owner_organization,
-       is_manually_managed = EXCLUDED.is_manually_managed,
-       mirror_of = EXCLUDED.mirror_of,
-       mirror_root = EXCLUDED.mirror_root,
-       quota_bytes = EXCLUDED.quota_bytes,
-       schema_version = EXCLUDED.schema_version,
-       catalog_state = EXCLUDED.catalog_state,
-       observed_at = now(),
-       stale = false
-     RETURNING *`,
-    [externalId, code, ownerOrg, isManuallyManaged, mirrorOf, mirrorRoot, quotaBytes, schemaVersion],
-  );
-  return rowToProblem(rows[0]);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended(lock_key, 0))
+       FROM unnest(ARRAY[$1::text, $2::text]) AS locks(lock_key)
+       ORDER BY lock_key`,
+      [`code:${code}`, `problem:${externalId}`],
+    );
+    const existingCode = await client.query(
+      `SELECT external_id, catalog_state
+       FROM problems
+       WHERE code = $1
+       FOR UPDATE`,
+      [code],
+    );
+    const codeOwner = existingCode.rows[0] as { external_id: string; catalog_state: string } | undefined;
+    if (codeOwner && codeOwner.external_id !== externalId) {
+      const expectedOrphanId = `orphan:${code}`;
+      if (codeOwner.catalog_state !== 'orphan' || codeOwner.external_id !== expectedOrphanId) {
+        throw new CatalogCodeConflictError(code, codeOwner.external_id);
+      }
+      const existingTarget = await client.query(
+        `SELECT external_id FROM problems WHERE external_id = $1 FOR UPDATE`,
+        [externalId],
+      );
+      if (existingTarget.rows[0]) {
+        const orphanHistory = await client.query(
+          `SELECT EXISTS (
+             SELECT 1 FROM snapshots WHERE problem_id = $1
+             UNION ALL
+             SELECT 1 FROM jobs WHERE problem_id = $1
+           ) AS has_history`,
+          [expectedOrphanId],
+        );
+        if (orphanHistory.rows[0]?.has_history === true) {
+          throw new OrphanHistoryConflictError(code);
+        }
+        // A normal code rename can leave both the authoritative problem row
+        // (under its previous code) and a watcher-created orphan row (under
+        // the new code). Merge the local accounting projection before
+        // removing the orphan so the UNIQUE(code) update below is safe.
+        await client.query(
+          `INSERT INTO problem_usage
+             (problem_id, logical_bytes, allocated_bytes, archive_bytes,
+              auxiliary_bytes, file_count, local_status, r2_status,
+              snapshot_generation, orphan_bytes, referenced_bytes, observed_at, stale)
+           SELECT $2, logical_bytes, allocated_bytes, archive_bytes,
+                  auxiliary_bytes, file_count, 'present', 'none',
+                  NULL, orphan_bytes, referenced_bytes, observed_at, stale
+           FROM problem_usage
+           WHERE problem_id = $1
+           ON CONFLICT (problem_id) DO UPDATE SET
+             logical_bytes = EXCLUDED.logical_bytes,
+             allocated_bytes = EXCLUDED.allocated_bytes,
+             archive_bytes = EXCLUDED.archive_bytes,
+             auxiliary_bytes = EXCLUDED.auxiliary_bytes,
+             file_count = EXCLUDED.file_count,
+             local_status = EXCLUDED.local_status,
+             orphan_bytes = EXCLUDED.orphan_bytes,
+             observed_at = GREATEST(problem_usage.observed_at, EXCLUDED.observed_at),
+             stale = EXCLUDED.stale`,
+          [expectedOrphanId, externalId],
+        );
+        await client.query(
+          `DELETE FROM problems
+           WHERE external_id = $1 AND code = $2 AND catalog_state = 'orphan'`,
+          [expectedOrphanId, code],
+        );
+      } else {
+        await client.query(
+          `UPDATE problems
+           SET external_id = $2
+           WHERE external_id = $1 AND code = $3 AND catalog_state = 'orphan'`,
+          [expectedOrphanId, externalId, code],
+        );
+      }
+    }
+    const { rows } = await client.query(
+      `INSERT INTO problems (external_id, code, owner_organization, is_manually_managed, mirror_of, mirror_root, quota_bytes, schema_version, catalog_state, observed_at, stale)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'present', now(), false)
+       ON CONFLICT (external_id) DO UPDATE SET
+         code = EXCLUDED.code,
+         owner_organization = EXCLUDED.owner_organization,
+         is_manually_managed = EXCLUDED.is_manually_managed,
+         mirror_of = EXCLUDED.mirror_of,
+         mirror_root = EXCLUDED.mirror_root,
+         quota_bytes = EXCLUDED.quota_bytes,
+         schema_version = EXCLUDED.schema_version,
+         catalog_state = EXCLUDED.catalog_state,
+         observed_at = now(),
+         stale = false
+       RETURNING *`,
+      [externalId, code, ownerOrg, isManuallyManaged, mirrorOf, mirrorRoot, quotaBytes, schemaVersion],
+    );
+    await client.query('COMMIT');
+    return rowToProblem(rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 export async function markMissingOutsideCatalog(pool: Pool, externalIds: string[]): Promise<number> {
@@ -77,6 +168,26 @@ export async function markMissingOutsideCatalog(pool: Pool, externalIds: string[
      SET catalog_state = 'missing', observed_at = now(), stale = false
      WHERE catalog_state <> 'orphan' AND NOT (external_id = ANY($1::text[]))`,
     [externalIds],
+  );
+  return rowCount ?? 0;
+}
+
+export async function clearDirtyForMissingLocal(pool: Pool): Promise<number> {
+  const { rowCount } = await pool.query(
+    `UPDATE problems p
+     SET dirty = false,
+         dirty_generation = NULL,
+         stale = false,
+         observed_at = now()
+     FROM problem_usage pu
+     WHERE pu.problem_id = p.external_id
+       AND pu.local_status = 'missing'
+       AND p.dirty = true
+       AND p.catalog_state IN ('present', 'mirror')
+       AND NOT EXISTS (
+         SELECT 1 FROM snapshots s
+         WHERE s.problem_id = p.external_id AND s.state = 'ready'
+       )`,
   );
   return rowCount ?? 0;
 }
@@ -157,7 +268,9 @@ export async function scheduleAutoSnapshotJobs(pool: Pool, problem: ProblemT, ac
 export async function scheduleDirtySnapshotBatch(pool: Pool, actor: string, limit: number): Promise<Array<{ problem_id: string; scan_job_id: string; snapshot_job_id: string }>> {
   const { rows } = await pool.query(
     `SELECT p.* FROM problems p
+     JOIN problem_usage pu ON pu.problem_id = p.external_id
      WHERE p.catalog_state IN ('present', 'mirror')
+       AND pu.local_status = 'present'
        AND (
          p.dirty = true
          OR NOT EXISTS (SELECT 1 FROM snapshots s WHERE s.problem_id = p.external_id AND s.state = 'ready')
@@ -739,14 +852,71 @@ export async function createJob(
     target_generation: opts.targetGeneration,
   });
   const { rows } = await pool.query(
-    `INSERT INTO jobs (idempotency_key, job_type, problem_id, target_generation, state, lease_owner, lease_expires_at, fencing_token, attempt, max_attempts, request_fingerprint)
-     VALUES ($1, $2, $3, $4, 'pending', NULL, NULL, 0, 1, 3, $5)
-     ON CONFLICT (idempotency_key, job_type) DO UPDATE SET
-       updated_at = now()
-     WHERE jobs.problem_id IS NOT DISTINCT FROM EXCLUDED.problem_id
-       AND jobs.target_generation IS NOT DISTINCT FROM EXCLUDED.target_generation
-       AND jobs.request_fingerprint = EXCLUDED.request_fingerprint
-     RETURNING *`,
+    `WITH lock AS (
+       SELECT pg_advisory_xact_lock(hashtextextended($2 || ':' || COALESCE($3, '') || ':' || COALESCE($4::text, ''), 0))
+     ),
+     key_row AS MATERIALIZED (
+       SELECT j.*
+       FROM jobs j, lock
+       WHERE j.idempotency_key = $1 AND j.job_type = $2
+       FOR UPDATE OF j
+     ),
+     replay AS (
+       UPDATE jobs
+       SET updated_at = now()
+       WHERE id = (
+         SELECT id FROM key_row
+         WHERE problem_id IS NOT DISTINCT FROM $3
+           AND target_generation IS NOT DISTINCT FROM $4::integer
+           AND request_fingerprint = $5
+       )
+       RETURNING *
+     ),
+     key_conflict AS (
+       SELECT 1 FROM key_row
+       WHERE NOT (
+         problem_id IS NOT DISTINCT FROM $3
+         AND target_generation IS NOT DISTINCT FROM $4::integer
+         AND request_fingerprint = $5
+       )
+     ),
+     active AS (
+       UPDATE jobs
+       SET updated_at = now()
+       WHERE id = (
+         SELECT id FROM jobs, lock
+         WHERE job_type = $2
+           AND problem_id IS NOT DISTINCT FROM $3
+           AND target_generation IS NOT DISTINCT FROM $4::integer
+           AND request_fingerprint = $5
+           AND state IN ('pending', 'running')
+           AND NOT EXISTS (SELECT 1 FROM replay)
+           AND NOT EXISTS (SELECT 1 FROM key_conflict)
+         ORDER BY created_at ASC
+         LIMIT 1
+       )
+       RETURNING *
+     ),
+     inserted AS (
+       INSERT INTO jobs (idempotency_key, job_type, problem_id, target_generation, state, lease_owner, lease_expires_at, fencing_token, attempt, max_attempts, request_fingerprint)
+       SELECT $1, $2, $3, $4::integer, 'pending', NULL, NULL, 0, 1, 3, $5
+       FROM lock
+       WHERE NOT EXISTS (SELECT 1 FROM replay)
+         AND NOT EXISTS (SELECT 1 FROM active)
+         AND NOT EXISTS (SELECT 1 FROM key_conflict)
+       ON CONFLICT (idempotency_key, job_type) DO UPDATE SET
+         updated_at = now()
+       WHERE jobs.problem_id IS NOT DISTINCT FROM EXCLUDED.problem_id
+         AND jobs.target_generation IS NOT DISTINCT FROM EXCLUDED.target_generation
+         AND jobs.request_fingerprint = EXCLUDED.request_fingerprint
+       RETURNING *
+     )
+     SELECT * FROM replay
+     UNION ALL
+     SELECT * FROM active
+     UNION ALL
+     SELECT * FROM inserted
+     LIMIT 1`,
     [opts.idempotencyKey, opts.jobType, opts.problemId, opts.targetGeneration, fingerprint],
   );
   if (!rows[0]) throw new IdempotencyConflictError();

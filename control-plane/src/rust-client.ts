@@ -67,7 +67,7 @@ export interface RustReadyResult {
 export class RustClient {
   private agent: Agent;
   constructor(private env: Env) {
-    this.agent = new Agent({ connectTimeout: 5000, headersTimeout: 30000 });
+    this.agent = new Agent({ connectTimeout: 5000 });
   }
 
   private headers(): Record<string, string> {
@@ -76,12 +76,14 @@ export class RustClient {
     return h;
   }
 
-  private async post<T>(path: string, body: unknown): Promise<T> {
+  private async post<T>(path: string, body: unknown, timeoutMs = 30000): Promise<T> {
     const res = await request(`${this.env.rustBaseUrl}${path}`, {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify(body),
       dispatcher: this.agent,
+      headersTimeout: timeoutMs,
+      bodyTimeout: timeoutMs,
     });
     if (res.statusCode >= 400) {
       const text = await res.body.text();
@@ -90,11 +92,13 @@ export class RustClient {
     return res.body.json() as Promise<T>;
   }
 
-  private async getJson<T>(path: string): Promise<T> {
+  private async getJson<T>(path: string, timeoutMs = 30000): Promise<T> {
     const res = await request(`${this.env.rustBaseUrl}${path}`, {
       method: 'GET',
       headers: this.headers(),
       dispatcher: this.agent,
+      headersTimeout: timeoutMs,
+      bodyTimeout: timeoutMs,
     });
     if (res.statusCode >= 400) {
       const text = await res.body.text();
@@ -107,7 +111,7 @@ export class RustClient {
     try {
       // Readiness includes PostgreSQL and the configured R2 bucket. The
       // dashboard must not report green while the data path is unusable.
-      await this.getJson('/internal/ready');
+      await this.getJson('/internal/ready', 10000);
       return true;
     } catch {
       return false;
@@ -119,7 +123,7 @@ export class RustClient {
   }
 
   async scan(code: string, problemExternalId?: string): Promise<RustScanResult> {
-    return this.post('/internal/scan', { code, problem_external_id: problemExternalId ?? null });
+    return this.post('/internal/scan', { code, problem_external_id: problemExternalId ?? null }, 600000);
   }
 
   async createSnapshot(problemExternalId: string, generation: number, code: string, fencingToken: number, dirtyVersion: number | string | null): Promise<RustSnapshot> {
@@ -129,15 +133,15 @@ export class RustClient {
       code,
       fencing_token: fencingToken,
       dirty_version: dirtyVersion,
-    });
+    }, 600000);
   }
 
   async restore(problemExternalId: string, generation: number, dest: string, fencingToken: number): Promise<{ status: string }> {
-    return this.post('/internal/restore', { problem_external_id: problemExternalId, generation, dest, fencing_token: fencingToken });
+    return this.post('/internal/restore', { problem_external_id: problemExternalId, generation, dest, fencing_token: fencingToken }, 600000);
   }
 
   async ready(problemExternalId: string, code: string): Promise<RustReadyResult> {
-    return this.getJson(`/internal/ready?problem_external_id=${encodeURIComponent(problemExternalId)}&code=${encodeURIComponent(code)}`);
+    return this.getJson(`/internal/ready?problem_external_id=${encodeURIComponent(problemExternalId)}&code=${encodeURIComponent(code)}`, 8000);
   }
 
   async evict(problemExternalId: string, code: string, dryRun: boolean, force: boolean, fencingToken: number): Promise<RustEvictResult> {
@@ -145,7 +149,7 @@ export class RustClient {
   }
 
   async reconcile(problems: Array<[string, string]>): Promise<RustReconcileResult> {
-    return this.post('/internal/reconcile', { problems });
+    return this.post('/internal/reconcile', { problems }, 600000);
   }
 
   async deleteObject(objectKey: string, fencingToken: number): Promise<{ deleted: boolean }> {

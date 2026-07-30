@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::{de, Deserialize, Deserializer};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use sqlx::PgPool;
 
 use crate::error::{AppError, AppResult};
@@ -62,12 +62,104 @@ async fn health(State(_s): State<AppState>) -> Json<serde_json::Value> {
 
 async fn ready(
     State(s): State<AppState>,
+    Query(query): Query<ReadyQuery>,
     headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
     check_token(&headers, &s.internal_token)?;
     sqlx::query("SELECT 1").execute(&s.db).await?;
+    if query.problem_external_id.is_some() || query.code.is_some() {
+        let problem_external_id = query
+            .problem_external_id
+            .ok_or_else(|| AppError::PathEscape("problem_external_id".to_string()))?;
+        let code = query
+            .code
+            .ok_or_else(|| AppError::PathEscape("code".to_string()))?;
+        let result = problem_readiness(&s, &problem_external_id, &code).await?;
+        return Ok(Json(serde_json::to_value(result)?));
+    }
     s.store.health_check().await?;
     Ok(Json(serde_json::json!({"status": "ready"})))
+}
+
+#[derive(Deserialize)]
+struct ReadyQuery {
+    problem_external_id: Option<String>,
+    code: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ProblemReadyResponse {
+    ready: bool,
+    local_status: String,
+    generation: Option<i64>,
+    observed_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn problem_readiness(
+    s: &AppState,
+    problem_external_id: &str,
+    code: &str,
+) -> AppResult<ProblemReadyResponse> {
+    let folder = paths::safe_problem_folder(s.problem_root.as_ref(), code)?;
+    if !folder.exists() {
+        let generation: Option<i64> = sqlx::query_scalar(
+            r#"SELECT generation::BIGINT FROM snapshots
+               WHERE problem_id = $1 AND state = 'ready'
+               ORDER BY generation DESC LIMIT 1"#,
+        )
+        .bind(problem_external_id)
+        .fetch_optional(&s.db)
+        .await?;
+        return Ok(ProblemReadyResponse {
+            ready: false,
+            local_status: "missing".to_string(),
+            generation,
+            observed_at: chrono::Utc::now(),
+        });
+    }
+    if !folder.is_dir() {
+        return Ok(ProblemReadyResponse {
+            ready: false,
+            local_status: "partial".to_string(),
+            generation: None,
+            observed_at: chrono::Utc::now(),
+        });
+    }
+    let scan = match scanner::scan_problem_folder(s.problem_root.as_ref(), code) {
+        Ok(scan) => scan,
+        Err(_) => {
+            return Ok(ProblemReadyResponse {
+                ready: false,
+                local_status: "partial".to_string(),
+                generation: None,
+                observed_at: chrono::Utc::now(),
+            });
+        }
+    };
+    let canonical = scanner::canonical_download_path_from_folder(&folder, &scan.files);
+    let matched_generation = if canonical.is_some() {
+        crate::db::ready_snapshot_matches_scan(&s.db, problem_external_id, &scan).await?
+    } else {
+        None
+    };
+    let latest_generation: Option<i64> = sqlx::query_scalar(
+        r#"SELECT generation::BIGINT FROM snapshots
+           WHERE problem_id = $1 AND state = 'ready'
+           ORDER BY generation DESC LIMIT 1"#,
+    )
+    .bind(problem_external_id)
+    .fetch_optional(&s.db)
+    .await?;
+    Ok(ProblemReadyResponse {
+        ready: matched_generation.is_some(),
+        local_status: if matched_generation.is_some() {
+            "present".to_string()
+        } else {
+            "partial".to_string()
+        },
+        generation: matched_generation.or(latest_generation),
+        observed_at: chrono::Utc::now(),
+    })
 }
 
 async fn get_volumes(State(s): State<AppState>, headers: HeaderMap) -> AppResult<Json<Volume>> {

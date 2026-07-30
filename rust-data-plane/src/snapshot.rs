@@ -82,29 +82,47 @@ impl SnapshotManager {
         problem_root: &Path,
         scan: &ScanResult,
     ) -> AppResult<Snapshot> {
-        let snapshot_id = uuid::Uuid::new_v4();
+        let requested_snapshot_id = uuid::Uuid::new_v4();
         let now = chrono::Utc::now();
 
         self.ensure_latest_fencing(problem_id, fencing_token)
             .await?;
 
-        // Insert snapshot row. If a concurrent job already created this generation, abort.
-        let inserted = sqlx::query(
+        // A failed attempt must be retryable with the same generation. Reuse
+        // only an error row; active, ready, and superseded generations remain
+        // immutable and continue to reject concurrent writers.
+        let snapshot_id = sqlx::query_scalar::<_, uuid::Uuid>(
             r#"INSERT INTO snapshots (id, problem_id, generation, state, file_count, total_bytes, created_at)
                VALUES ($1, $2, $3, 'discovered', 0, 0, $4)
-               ON CONFLICT (problem_id, generation) DO NOTHING"#,
+               ON CONFLICT (problem_id, generation) DO UPDATE SET
+                   state = 'discovered',
+                   file_count = 0,
+                   total_bytes = 0,
+                   manifest_key = NULL,
+                   error_code = NULL,
+                   error_message = NULL,
+                   created_at = EXCLUDED.created_at,
+                   completed_at = NULL
+               WHERE snapshots.state = 'error'
+               RETURNING snapshots.id"#,
         )
-        .bind(snapshot_id)
+        .bind(requested_snapshot_id)
         .bind(problem_id)
         .bind(generation)
         .bind(now)
-        .execute(&self.db)
+        .fetch_optional(&self.db)
         .await?;
-        if inserted.rows_affected() == 0 {
+        let Some(snapshot_id) = snapshot_id else {
             return Err(AppError::Internal(format!(
                 "snapshot generation {generation} already exists for problem {problem_id}"
             )));
-        }
+        };
+        // Defensive cleanup for any future failure path that may have written
+        // object identities before rolling the snapshot into the error state.
+        sqlx::query("DELETE FROM snapshot_objects WHERE snapshot_id = $1")
+            .bind(snapshot_id)
+            .execute(&self.db)
+            .await?;
 
         let result = self
             .create_snapshot_after_insert(
@@ -142,6 +160,15 @@ impl SnapshotManager {
             .await?;
 
         let folder = paths::safe_problem_folder(problem_root, &scan.code)?;
+        let canonical_download_path =
+            scanner::canonical_download_path_from_folder(&folder, &scan.files).ok_or_else(
+                || {
+                    AppError::ManifestIntegrity(
+                        "problem folder must contain init.yml with an existing canonical archive"
+                            .to_string(),
+                    )
+                },
+            )?;
         sqlx::query(
             r#"UPDATE snapshots SET state = 'uploading' WHERE id = $1 AND state = 'hashing'"#,
         )
@@ -180,10 +207,7 @@ impl SnapshotManager {
             generation,
             created_at: now,
             files: manifest_files.clone(),
-            canonical_download_path: scanner::canonical_download_path_from_folder(
-                &folder,
-                &scan.files,
-            ),
+            canonical_download_path: Some(canonical_download_path),
             total_bytes,
             file_count: manifest_files.len() as i64,
         };
@@ -473,7 +497,6 @@ impl SnapshotManager {
                 generation,
             });
         }
-
         let old = parent.join(format!(
             ".{}.old.{}",
             dest.file_name()

@@ -2,7 +2,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
 use crate::error::AppResult;
-use crate::models::ProblemUsage;
+use crate::models::{ProblemUsage, ScanResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogProblem {
@@ -273,6 +273,126 @@ pub async fn mark_stale(pool: &PgPool, code: &str) -> AppResult<()> {
     Ok(())
 }
 
+pub async fn mark_local_missing_by_code(pool: &PgPool, code: &str) -> AppResult<()> {
+    sqlx::query(
+        r#"UPDATE problem_usage
+           SET local_status = 'missing', observed_at = now(), stale = false
+           WHERE problem_id IN (
+             SELECT external_id FROM problems
+             WHERE code = $1 AND catalog_state IN ('present', 'mirror')
+           )"#,
+    )
+    .bind(code)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_local_verified(
+    pool: &PgPool,
+    problem_id: &str,
+    generation: i64,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"UPDATE problem_usage
+           SET local_status = 'present',
+               snapshot_generation = GREATEST(COALESCE(snapshot_generation, 0), $2),
+               observed_at = now(),
+               stale = false
+           WHERE problem_id = $1"#,
+    )
+    .bind(problem_id)
+    .bind(generation)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn ready_snapshot_matches_scan(
+    pool: &PgPool,
+    problem_id: &str,
+    scan: &ScanResult,
+) -> AppResult<Option<i64>> {
+    let snapshot = sqlx::query_as::<_, ReadySnapshotRow>(
+        r#"SELECT s.id, s.generation::BIGINT AS generation
+           FROM snapshots s
+           JOIN problems p ON p.external_id = s.problem_id
+           WHERE s.problem_id = $1
+             AND s.state = 'ready'
+             AND p.dirty = false
+           ORDER BY s.generation DESC
+           LIMIT 1"#,
+    )
+    .bind(problem_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    let expected = sqlx::query_as::<_, SnapshotObjectIdentityRow>(
+        r#"SELECT rel_path, sha256, size_bytes
+           FROM snapshot_objects
+           WHERE snapshot_id = $1
+           ORDER BY rel_path ASC"#,
+    )
+    .bind(snapshot.id)
+    .fetch_all(pool)
+    .await?;
+    let expected: Vec<(String, String, i64)> = expected
+        .into_iter()
+        .map(|row| (row.rel_path, row.sha256, row.size_bytes))
+        .collect();
+    let matches = scan_matches_snapshot_objects(scan, &expected);
+    Ok(matches.then_some(snapshot.generation))
+}
+
+pub fn scan_matches_snapshot_objects(
+    scan: &ScanResult,
+    expected: &[(String, String, i64)],
+) -> bool {
+    if expected.len() != scan.files.len() {
+        return false;
+    }
+    let mut actual: Vec<(&str, &str, i64)> = scan
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file.sha256.as_str(), file.size as i64))
+        .collect();
+    actual.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut expected: Vec<(&str, &str, i64)> = expected
+        .iter()
+        .map(|item| (item.0.as_str(), item.1.as_str(), item.2))
+        .collect();
+    expected.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    expected
+        .iter()
+        .zip(actual.iter())
+        .all(|(expected, actual)| {
+            expected.0 == actual.0 && expected.1 == actual.1 && expected.2 == actual.2
+        })
+}
+
+pub async fn ready_snapshot_matches_scan_by_code(
+    pool: &PgPool,
+    code: &str,
+    scan: &ScanResult,
+) -> AppResult<Option<(String, i64)>> {
+    let problem_id: Option<String> = sqlx::query_scalar(
+        r#"SELECT external_id
+           FROM problems
+           WHERE code = $1 AND catalog_state IN ('present', 'mirror')"#,
+    )
+    .bind(code)
+    .fetch_optional(pool)
+    .await?;
+    let Some(problem_id) = problem_id else {
+        return Ok(None);
+    };
+    Ok(ready_snapshot_matches_scan(pool, &problem_id, scan)
+        .await?
+        .map(|generation| (problem_id, generation)))
+}
+
 pub async fn list_catalog_problems(pool: &PgPool) -> AppResult<Vec<CatalogProblem>> {
     let rows = sqlx::query_as::<_, CatalogProblemRow>(
         r#"SELECT external_id, code, catalog_state FROM problems
@@ -308,6 +428,19 @@ struct CatalogProblemRow {
     external_id: String,
     code: String,
     catalog_state: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct ReadySnapshotRow {
+    id: uuid::Uuid,
+    generation: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct SnapshotObjectIdentityRow {
+    rel_path: String,
+    sha256: String,
+    size_bytes: i64,
 }
 
 pub async fn get_problem_usage_by_code(

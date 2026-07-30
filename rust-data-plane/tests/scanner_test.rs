@@ -169,6 +169,21 @@ fn test_canonical_download_rejects_traversal_archive() {
     );
 }
 
+#[test]
+fn test_canonical_download_requires_existing_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = "canonical_missing";
+    let folder = dir.path().join(code);
+    fs::create_dir(&folder).unwrap();
+    fs::write(folder.join("init.yml"), "archive: absent.zip\n").unwrap();
+
+    let scan = scan_problem_folder(dir.path(), code).unwrap();
+    assert_eq!(
+        canonical_download_path_from_folder(&folder, &scan.files),
+        None
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn test_scan_rejects_fifo_special_file() {

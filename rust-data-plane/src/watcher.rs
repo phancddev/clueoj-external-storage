@@ -115,6 +115,34 @@ async fn snapshot_dirty_code(
     store: Arc<dyn ObjectStore>,
     code: &str,
 ) -> crate::error::AppResult<()> {
+    let folder = crate::paths::safe_problem_folder(root, code)?;
+    if !folder.exists() {
+        db::mark_local_missing_by_code(db, code).await?;
+        tracing::info!(
+            code,
+            "watcher marked problem folder missing without snapshot"
+        );
+        return Ok(());
+    }
+    if !folder.is_dir() {
+        tracing::debug!(code, "watcher ignored non-directory path in problem root");
+        return Ok(());
+    }
+    let mut scan = scanner::scan_problem_folder(root, code)?;
+    if scanner::canonical_download_path_from_folder(&folder, &scan.files).is_some() {
+        if let Some((problem_id, generation)) =
+            db::ready_snapshot_matches_scan_by_code(db, code, &scan).await?
+        {
+            db::mark_local_verified(db, &problem_id, generation).await?;
+            tracing::info!(
+                code,
+                problem_id,
+                generation,
+                "watcher verified no-op/restore event against READY snapshot"
+            );
+            return Ok(());
+        }
+    }
     let worker_id = format!("rust-watcher:{}", std::process::id());
     let Some((job_id, problem_id, generation, fencing_token, dirty_version)) =
         db::acquire_dirty_snapshot_job_by_code(db, code, &worker_id, WATCHER_LEASE_SECONDS).await?
@@ -147,7 +175,6 @@ async fn snapshot_dirty_code(
     });
 
     let work = async {
-        let mut scan = scanner::scan_problem_folder(root, code)?;
         scan.problem_external_id = Some(problem_id.clone());
         db::assert_job_lease(db, job_id, &worker_id, fencing_token).await?;
         db::upsert_problem_usage(

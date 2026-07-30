@@ -128,8 +128,11 @@ class OrgSqlPool {
 }
 
 class AutoSchedulePool {
+  public insertedJobs = 0;
+
   async query(sql: string, params: unknown[]) {
     if (sql.includes('INSERT INTO jobs')) {
+      this.insertedJobs++;
       return { rows: [{
         ...baseJob,
         id: String(params[1]) === 'scan' ? 'scan-job' : 'snapshot-job',
@@ -337,6 +340,12 @@ describe('DB contract hardening', () => {
       stale: true,
     }, 'catalog-reconcile');
     expect(jobs).toEqual({ scan_job_id: 'scan-job', snapshot_job_id: 'snapshot-job' });
+  });
+
+  it('batch scheduling only selects problems with a present local projection', async () => {
+    const pool = new OrgSqlPool();
+    await db.scheduleDirtySnapshotBatch(pool as any, 'catalog-reconcile', 100);
+    expect(pool.sql).toContain("pu.local_status = 'present'");
   });
 
   it('dirty idempotency replays same key/body without a second version increment', async () => {

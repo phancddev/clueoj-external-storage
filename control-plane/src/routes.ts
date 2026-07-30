@@ -198,7 +198,21 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
     if (err instanceof db.CatalogCodeConflictError) {
       return reply.code(409).send({ code: 'catalog_code_conflict', message: err.message, retryable: false, request_id: requestId });
     }
+    if (err instanceof db.OrphanHistoryConflictError) {
+      return reply.code(409).send({ code: 'orphan_history_conflict', message: err.message, retryable: false, request_id: requestId });
+    }
     return reply.code(502).send({ code: 'rust_error', message: (err as Error).message, retryable: true, request_id: requestId });
+  }
+
+  function rejectTerminalEnsureJob(reply: FastifyReply, job: { id: string; state: string }, requestId: string): boolean {
+    if (!['completed', 'failed', 'cancelled'].includes(job.state)) return false;
+    reply.code(409).send({
+      code: 'ensure_ready_job_terminal',
+      message: `Previous ensure-ready job ${job.id} is ${job.state}; retry with a new Idempotency-Key`,
+      retryable: true,
+      request_id: requestId,
+    });
+    return true;
   }
 
   // ======================================================================
@@ -311,7 +325,7 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
     try {
       for (const p of body.problems) {
         const catalog = catalogProblemFrom(p);
-        const problem = await db.upsertProblem(
+        await db.upsertProblem(
           ctx.pool,
           catalog.externalId,
           catalog.code,
@@ -322,13 +336,23 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
           catalog.quotaBytes,
           catalog.schemaVersion,
         );
-        const dirty = await db.markDirtyIfNoReady(ctx.pool, problem.external_id) ?? problem;
-        await db.scheduleAutoSnapshotJobs(ctx.pool, dirty, 'catalog-reconcile');
       }
       const catalogProblems = body.problems.map((p) => catalogProblemFrom(p));
       const missing = await db.markMissingOutsideCatalog(ctx.pool, catalogProblems.map((p) => p.externalId));
       const problemsTuple = catalogProblems.map((p) => [p.externalId, p.code] as [string, string]);
       const result = await ctx.rust.reconcile(problemsTuple);
+      await db.clearDirtyForMissingLocal(ctx.pool);
+      for (const catalog of catalogProblems) {
+        if (catalog.catalogState !== 'present') continue;
+        const usage = await db.getProblemUsage(ctx.pool, catalog.externalId);
+        if (!usage || usage.local_status !== 'present') continue;
+        const problem = await db.getProblem(ctx.pool, catalog.externalId);
+        if (!problem) continue;
+        const dirty = problem.dirty
+          ? problem
+          : await db.markDirtyIfNoReady(ctx.pool, problem.external_id) ?? problem;
+        await db.scheduleAutoSnapshotJobs(ctx.pool, dirty, 'catalog-reconcile');
+      }
       const normalized = {
         discovered: result.discovered ?? 0,
         present: body.problems.length,
@@ -436,7 +460,7 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
     if (actual.ready && actual.local_status === 'present' && !problem.dirty) {
       return reply.send({ status: 'ready', ready: true });
     }
-    if (actual.ready && actual.local_status === 'present' && problem.dirty) {
+    if (actual.local_status === 'present' && problem.dirty) {
       const generation = problem.dirty_generation ?? await db.allocateGeneration(ctx.pool, externalId);
       const job = await db.createJob(ctx.pool, {
         idempotencyKey: key,
@@ -446,9 +470,18 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
         leaseOwner: getAuth(req).sub,
         requestFingerprint: db.stableFingerprint({ action: 'ensure-ready-snapshot', external_id: externalId, generation, dirty_version: problem.dirty_version }),
       });
+      if (rejectTerminalEnsureJob(reply, job, getRequestId(req))) return;
       await db.setJobPayload(ctx.pool, job.id, { dirty_version: problem.dirty_version });
       await audit(ctx, req, 'problem.ensure_ready_snapshot', { problemId: externalId, generation, jobId: job.id });
       return reply.code(202).send({ status: 'snapshotting', ready: false, ...accepted(job) });
+    }
+    if (actual.local_status !== 'missing') {
+      return reply.code(409).send({
+        code: 'local_integrity_mismatch',
+        message: 'Local problem data does not match a verified READY snapshot; refusing destructive restore',
+        retryable: true,
+        request_id: getRequestId(req),
+      });
     }
     const snapshot = await db.getLatestReadySnapshot(ctx.pool, externalId);
     if (!snapshot) {
@@ -462,6 +495,7 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
       leaseOwner: getAuth(req).sub,
       requestFingerprint: db.stableFingerprint({ action: 'ensure-ready-restore', external_id: externalId, generation: snapshot.generation }),
     });
+    if (rejectTerminalEnsureJob(reply, job, getRequestId(req))) return;
     await audit(ctx, req, 'problem.ensure_ready', { problemId: externalId, generation: snapshot.generation, jobId: job.id });
     reply.code(202).send({ status: 'restoring', ready: false, ...accepted(job) });
   });

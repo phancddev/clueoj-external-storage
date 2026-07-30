@@ -89,4 +89,30 @@ describe('RustClient contract', () => {
       dirty_version: '9223372036854775807',
     });
   });
+
+  it('requests per-problem readiness with the Rust client contract fields', async () => {
+    let requestedPath = '';
+    server = createServer((req, res) => {
+      requestedPath = req.url || '';
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        ready: false,
+        local_status: 'missing',
+        generation: 17,
+        observed_at: '2026-07-30T00:00:00.000Z',
+      }));
+    });
+    await new Promise<void>((resolve) => server?.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('unexpected server address');
+
+    const client = new RustClient(envFor(`http://127.0.0.1:${address.port}`));
+    await expect(client.ready('p 1', 'sum/a')).resolves.toMatchObject({
+      ready: false,
+      local_status: 'missing',
+      generation: 17,
+      observed_at: '2026-07-30T00:00:00.000Z',
+    });
+    expect(requestedPath).toBe('/internal/ready?problem_external_id=p%201&code=sum%2Fa');
+  });
 });

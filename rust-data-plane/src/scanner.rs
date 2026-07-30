@@ -64,8 +64,7 @@ pub fn scan_problem_folder(root: &Path, code: &str) -> AppResult<ScanResult> {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                tracing::warn!(error = %e, "walkdir error, skipping");
-                continue;
+                return Err(AppError::Internal(format!("walkdir error: {e}")));
             }
         };
         if entry.path() == folder {
@@ -78,19 +77,9 @@ pub fn scan_problem_folder(root: &Path, code: &str) -> AppResult<ScanResult> {
             continue;
         }
 
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => {
-                let lmeta = match std::fs::symlink_metadata(entry.path()) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                if lmeta.is_symlink() {
-                    tracing::warn!(path = ?entry.path(), "symlink skipped");
-                }
-                continue;
-            }
-        };
+        let meta = entry
+            .metadata()
+            .map_err(|e| AppError::Internal(format!("metadata error: {e}")))?;
 
         if meta.is_dir() {
             continue;
@@ -129,10 +118,7 @@ pub fn scan_problem_folder(root: &Path, code: &str) -> AppResult<ScanResult> {
             let hash = match stable_sha256_file(entry.path(), 2) {
                 Ok(h) => h,
                 Err(AppError::FileChurn(_)) => return Err(AppError::FileChurn(rel_path.clone())),
-                Err(e) => {
-                    tracing::warn!(error = %e, path = ?entry.path(), "hash failed, skipping file");
-                    continue;
-                }
+                Err(e) => return Err(e),
             };
             (hash, None)
         };

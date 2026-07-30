@@ -62,7 +62,7 @@ class FakePool {
 }
 
 class EnsureReadyPool {
-  constructor(private mode: 'ready' | 'restore' | 'unavailable' | 'snapshotting') {}
+  constructor(private mode: 'ready' | 'restore' | 'unavailable' | 'snapshotting' | 'terminal' | 'partial-clean' | 'partial-dirty') {}
   async query(sql: string, params: unknown[] = []) {
     const dashboardUser = dashboardUserResult(sql, params);
     if (dashboardUser) return dashboardUser;
@@ -76,7 +76,7 @@ class EnsureReadyPool {
         mirror_root: null,
         quota_bytes: null,
         catalog_state: 'present',
-        dirty: this.mode !== 'ready',
+        dirty: this.mode === 'snapshotting' || this.mode === 'partial-dirty',
         dirty_generation: 10,
         dirty_version: 3,
         observed_at: new Date(),
@@ -102,7 +102,7 @@ class EnsureReadyPool {
       }] : [], rowCount: this.mode === 'ready' ? 1 : 0 };
     }
     if (sql.includes('FROM snapshots')) {
-      return { rows: this.mode === 'restore' ? [{
+      return { rows: this.mode === 'restore' || this.mode === 'terminal' ? [{
         id: 'snap-1',
         problem_id: 'p1',
         generation: 9,
@@ -114,7 +114,7 @@ class EnsureReadyPool {
         error_message: null,
         created_at: new Date(),
         completed_at: new Date(),
-      }] : [], rowCount: this.mode === 'restore' ? 1 : 0 };
+      }] : [], rowCount: this.mode === 'restore' || this.mode === 'terminal' ? 1 : 0 };
     }
     if (sql.includes('INSERT INTO problem_generation_counters')) {
       return { rows: [{ generation: 10 }], rowCount: 1 };
@@ -126,7 +126,7 @@ class EnsureReadyPool {
         job_type: this.mode === 'snapshotting' ? 'snapshot' : 'restore',
         problem_id: 'p1',
         target_generation: this.mode === 'snapshotting' ? 10 : 9,
-        state: 'pending',
+        state: this.mode === 'terminal' ? 'failed' : 'pending',
         lease_owner: null,
         lease_expires_at: null,
         fencing_token: 1,
@@ -178,6 +178,18 @@ class DirtyEndpointPool {
     if (sql.includes('SELECT * FROM problems WHERE external_id')) {
       const row = this.problems[String(params[0])];
       return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
+    }
+    if (sql.includes('SELECT external_id FROM problems WHERE external_id')) {
+      const row = this.problems[String(params[0])];
+      return { rows: row ? [{ external_id: row.external_id }] : [], rowCount: row ? 1 : 0 };
+    }
+    if (sql.includes('SELECT EXISTS') && sql.includes('FROM snapshots')) {
+      return { rows: [{ has_history: false }], rowCount: 1 };
+    }
+    if (sql.includes('INSERT INTO problem_usage')) return { rows: [], rowCount: 1 };
+    if (sql.includes('DELETE FROM problems')) {
+      delete this.problems[String(params[0])];
+      return { rows: [], rowCount: 1 };
     }
     if (sql.includes('FROM problems') && sql.includes('WHERE code = $1') && sql.includes('FOR UPDATE')) {
       const row = Object.values(this.problems).find((problem) => problem.code === params[0]);
@@ -285,11 +297,15 @@ const rust = {
   }),
 };
 
-const rustByMode = (mode: 'ready' | 'restore' | 'unavailable' | 'snapshotting') => ({
+const rustByMode = (mode: 'ready' | 'restore' | 'unavailable' | 'snapshotting' | 'terminal' | 'partial-clean' | 'partial-dirty') => ({
   ...rust,
   ready: async () => ({
     ready: mode === 'ready' || mode === 'snapshotting',
-    local_status: mode === 'ready' || mode === 'snapshotting' ? 'present' : 'missing',
+    local_status: mode === 'ready' || mode === 'snapshotting'
+      ? 'present'
+      : mode === 'partial-clean' || mode === 'partial-dirty'
+        ? 'partial'
+        : 'missing',
     generation: null,
     observed_at: '2026-07-29T00:00:00.000Z',
   }),
@@ -458,6 +474,45 @@ describe('runtime route contracts', () => {
     expect(res.json()).toMatchObject({ status: 'snapshotting', ready: false, job_id: 'job-snapshot' });
   });
 
+  it('ensure-ready refuses to snapshot dirty partial data over a complete snapshot', async () => {
+    const app = Fastify({ logger: false });
+    await buildRoutes(app, { pool: new EnsureReadyPool('partial-dirty') as any, env, rust: rustByMode('partial-dirty') as any });
+    const token = await signOperatorToken(env.dashboardJwtSecret, 'admin', 'operator', 60, env.dashboardJwtAudience);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/problems/p1/ensure-ready',
+      headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'idem-ensure' },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ code: 'local_integrity_mismatch', retryable: true });
+  });
+
+  it('ensure-ready refuses to overwrite unverified local data', async () => {
+    const app = Fastify({ logger: false });
+    await buildRoutes(app, { pool: new EnsureReadyPool('partial-clean') as any, env, rust: rustByMode('partial-clean') as any });
+    const token = await signOperatorToken(env.dashboardJwtSecret, 'admin', 'operator', 60, env.dashboardJwtAudience);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/problems/p1/ensure-ready',
+      headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'idem-ensure' },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ code: 'local_integrity_mismatch', retryable: true });
+  });
+
+  it('ensure-ready exposes terminal job replay so the client can rotate its key', async () => {
+    const app = Fastify({ logger: false });
+    await buildRoutes(app, { pool: new EnsureReadyPool('terminal') as any, env, rust: rustByMode('terminal') as any });
+    const token = await signOperatorToken(env.dashboardJwtSecret, 'admin', 'operator', 60, env.dashboardJwtAudience);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/problems/p1/ensure-ready',
+      headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'idem-ensure' },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ code: 'ensure_ready_job_terminal', retryable: true });
+  });
+
   it('dirty upload schedules scan and snapshot once for the first idempotent mutation', async () => {
     const app = Fastify({ logger: false });
     const pool = new DirtyEndpointPool();
@@ -546,6 +601,44 @@ describe('runtime route contracts', () => {
       catalog_state: 'present',
       dirty: true,
     });
+  });
+
+  it('dirty upload merges an orphan when the authoritative problem already exists under an old code', async () => {
+    const app = Fastify({ logger: false });
+    const pool = new DirtyEndpointPool();
+    pool.problems['42'] = {
+      external_id: '42',
+      code: 'old-code',
+      catalog_state: 'present',
+      dirty: false,
+      dirty_generation: null,
+      dirty_version: 0,
+      observed_at: new Date(),
+      stale: false,
+    };
+    pool.problems['orphan:new-code'] = {
+      external_id: 'orphan:new-code',
+      code: 'new-code',
+      catalog_state: 'orphan',
+      dirty: false,
+      dirty_generation: null,
+      dirty_version: 0,
+      observed_at: new Date(),
+      stale: false,
+    };
+    await buildRoutes(app, { pool: pool as any, env, rust: rust as any });
+    const token = await signServiceToken(env.clueojServiceSecret, 'clueoj', env.clueojServiceAudience, ['mutate'], 60);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/v1/problems/42/dirty',
+      headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'idem-rename-orphan' },
+      payload: { external_id: '42', code: 'new-code', schema_version: 1 },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(pool.problems['orphan:new-code']).toBeUndefined();
+    expect(pool.problems['42']).toMatchObject({ code: 'new-code', catalog_state: 'present' });
   });
 
   it('dirty retry recovers missing auto-push jobs after post-commit scheduling failure', async () => {
