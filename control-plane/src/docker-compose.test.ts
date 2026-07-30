@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 
@@ -7,7 +7,12 @@ const composePath = resolve(__dirname, '../../docker-compose.yml');
 const compose = parseYaml(readFileSync(composePath, 'utf-8'));
 
 const clueojComposePath = resolve(__dirname, '../../../clueoj/docker-compose.yml');
-const clueojCompose = parseYaml(readFileSync(clueojComposePath, 'utf-8'));
+const clueojStorageClientComposePath = resolve(__dirname, '../../../clueoj/docker-compose.storage-client.yml');
+const hasSiblingClueoj = existsSync(clueojComposePath) && existsSync(clueojStorageClientComposePath);
+const clueojCompose = hasSiblingClueoj ? parseYaml(readFileSync(clueojComposePath, 'utf-8')) : null;
+const clueojStorageClientCompose = hasSiblingClueoj
+  ? parseYaml(readFileSync(clueojStorageClientComposePath, 'utf-8'))
+  : null;
 
 describe('storage app docker-compose.yml', () => {
   it('has storage-db service with healthcheck and volume', () => {
@@ -58,51 +63,37 @@ describe('storage app docker-compose.yml', () => {
   });
 });
 
-describe('clueoj docker-compose.yml storage integration', () => {
-  it('has storage-db service', () => {
-    expect(clueojCompose.services['storage-db']).toBeDefined();
+describe.skipIf(!hasSiblingClueoj)('clueoj client-only storage override', () => {
+  it('does not run storage services in the base ClueOJ compose file', () => {
+    expect(clueojCompose!.services['storage-db']).toBeUndefined();
+    expect(clueojCompose!.services['storage-migrate']).toBeUndefined();
+    expect(clueojCompose!.services['storage-rust']).toBeUndefined();
+    expect(clueojCompose!.services['storage-web']).toBeUndefined();
   });
 
-  it('has storage-migrate service', () => {
-    expect(clueojCompose.services['storage-migrate']).toBeDefined();
+  it('adds storage.env and host-gateway to site and celery only', () => {
+    for (const name of ['site', 'celery']) {
+      const svc = clueojStorageClientCompose!.services[name];
+      expect(svc).toBeDefined();
+      expect(svc.env_file).toContain('environment/storage.env');
+      expect(svc.extra_hosts).toContain('host.docker.internal:host-gateway');
+    }
   });
 
-  it('has storage-rust service with problems volume mount', () => {
-    const svc = clueojCompose.services['storage-rust'];
+  it('adds celery-beat using the existing celery image and ClueOJ networks', () => {
+    const svc = clueojStorageClientCompose!.services['celery-beat'];
     expect(svc).toBeDefined();
-    const vols = svc.volumes ?? [];
-    expect(vols.some((v: string) => v.includes('./problems/:/problems/'))).toBe(true);
+    expect(svc.image).toBe('vnoj/vnoj-celery');
+    expect(svc.env_file).toContain('environment/storage.env');
+    expect(svc.extra_hosts).toContain('host.docker.internal:host-gateway');
+    expect(svc.networks).toContain('site');
+    expect(svc.networks).toContain('db');
   });
 
-  it('storage-rust has no host port', () => {
-    const svc = clueojCompose.services['storage-rust'];
-    expect(svc.ports).toBeUndefined();
-  });
-
-  it('has storage-web publishing 2907', () => {
-    const svc = clueojCompose.services['storage-web'];
-    expect(svc).toBeDefined();
-    const ports = svc.ports ?? [];
-    expect(ports.some((p: string) => p.includes('2907'))).toBe(true);
-  });
-
-  it('has celery-beat service', () => {
-    expect(clueojCompose.services['celery-beat']).toBeDefined();
-  });
-
-  it('storage-db has no host port', () => {
-    const svc = clueojCompose.services['storage-db'];
-    expect(svc.ports).toBeUndefined();
-  });
-
-  it('has storage-net network', () => {
-    expect(clueojCompose.networks).toHaveProperty('storage-net');
-  });
-
-  it('storage-web is on both storage-net and site networks', () => {
-    const svc = clueojCompose.services['storage-web'];
-    const nets = svc.networks ?? [];
-    expect(nets).toContain('storage-net');
-    expect(nets).toContain('site');
+  it('does not define storage services in the client override', () => {
+    expect(clueojStorageClientCompose!.services['storage-db']).toBeUndefined();
+    expect(clueojStorageClientCompose!.services['storage-migrate']).toBeUndefined();
+    expect(clueojStorageClientCompose!.services['storage-rust']).toBeUndefined();
+    expect(clueojStorageClientCompose!.services['storage-web']).toBeUndefined();
   });
 });
