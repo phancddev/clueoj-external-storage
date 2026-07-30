@@ -1,0 +1,169 @@
+services:
+  # Startup contract: copy .env.example to .env, fill secrets, set
+  # STORAGE_RUST_UID/GID to the numeric owner of STORAGE_PROBLEM_ROOT_HOST.
+  storage-env-check:
+    image: alpine:3.20
+    env_file:
+      - path: .env
+        required: false
+    command:
+      - /bin/sh
+      - -eu
+      - -c
+      - |
+        : "$${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
+        : "$${STORAGE_DATABASE_URL:?STORAGE_DATABASE_URL is required}"
+        : "$${STORAGE_JWT_SECRET:?STORAGE_JWT_SECRET is required}"
+        : "$${STORAGE_DASHBOARD_JWT_SECRET:?STORAGE_DASHBOARD_JWT_SECRET is required}"
+        : "$${STORAGE_DASHBOARD_JWT_AUDIENCE:?STORAGE_DASHBOARD_JWT_AUDIENCE is required}"
+        : "$${STORAGE_CLUEOJ_SERVICE_SECRET:?STORAGE_CLUEOJ_SERVICE_SECRET is required}"
+        : "$${STORAGE_INTERNAL_SERVICE_TOKEN:?STORAGE_INTERNAL_SERVICE_TOKEN is required}"
+        : "$${STORAGE_RUST_UID:?STORAGE_RUST_UID is required; set to id -u of the problem-root owner}"
+        : "$${STORAGE_RUST_GID:?STORAGE_RUST_GID is required; set to id -g of the problem-root owner}"
+        require_real_secret() {
+          name="$$1"
+          value="$$2"
+          min_len="$$3"
+          case "$$value" in
+            ""|replace-with-*|change-me*|changeme*|admin|password|storage|secret|test|test-*) echo "$$name must be set to a non-placeholder secret" >&2; exit 64 ;;
+          esac
+          if [ "$${#value}" -lt "$$min_len" ]; then
+            echo "$$name must be at least $$min_len characters" >&2
+            exit 64
+          fi
+        }
+        case "$$STORAGE_DATABASE_URL" in *replace-with*|*change-me*|*storage:storage*) echo "STORAGE_DATABASE_URL contains a placeholder/default password" >&2; exit 64 ;; esac
+        require_real_secret POSTGRES_PASSWORD "$$POSTGRES_PASSWORD" 16
+        require_real_secret STORAGE_JWT_SECRET "$$STORAGE_JWT_SECRET" 32
+        require_real_secret STORAGE_DASHBOARD_JWT_SECRET "$$STORAGE_DASHBOARD_JWT_SECRET" 32
+        require_real_secret STORAGE_CLUEOJ_SERVICE_SECRET "$$STORAGE_CLUEOJ_SERVICE_SECRET" 32
+        require_real_secret STORAGE_INTERNAL_SERVICE_TOKEN "$$STORAGE_INTERNAL_SERVICE_TOKEN" 32
+        if [ "$${STORAGE_DASHBOARD_JWT_SECRET}" = "$${STORAGE_JWT_SECRET}" ]; then
+          echo "STORAGE_DASHBOARD_JWT_SECRET must be distinct from STORAGE_JWT_SECRET" >&2
+          exit 64
+        fi
+        case "$${STORAGE_OBJECT_STORE:-r2}" in
+          inmemory)
+            if [ "$${STORAGE_ALLOW_INSECURE_DEV:-false}" != "true" ]; then
+              echo "STORAGE_OBJECT_STORE=inmemory requires STORAGE_ALLOW_INSECURE_DEV=true" >&2
+              exit 64
+            fi
+            ;;
+          r2)
+            if [ "$${STORAGE_ALLOW_INSECURE_DEV:-false}" = "true" ]; then
+              echo "STORAGE_ALLOW_INSECURE_DEV must be false when STORAGE_OBJECT_STORE=r2" >&2
+              exit 64
+            fi
+            : "$${R2_ENDPOINT:?R2_ENDPOINT is required when STORAGE_OBJECT_STORE=r2}"
+            : "$${R2_ACCESS_KEY_ID:?R2_ACCESS_KEY_ID is required when STORAGE_OBJECT_STORE=r2}"
+            : "$${R2_SECRET_ACCESS_KEY:?R2_SECRET_ACCESS_KEY is required when STORAGE_OBJECT_STORE=r2}"
+            : "$${R2_BUCKET_NAME:?R2_BUCKET_NAME is required when STORAGE_OBJECT_STORE=r2}"
+            require_real_secret R2_ACCESS_KEY_ID "$$R2_ACCESS_KEY_ID" 16
+            require_real_secret R2_SECRET_ACCESS_KEY "$$R2_SECRET_ACCESS_KEY" 32
+            ;;
+          *) echo "STORAGE_OBJECT_STORE must be r2 or inmemory" >&2; exit 64 ;;
+        esac
+  storage-db:
+    image: postgres:16-alpine
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - storage-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER:-storage}\" -d \"$${POSTGRES_DB:-storage}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    depends_on:
+      storage-env-check:
+        condition: service_completed_successfully
+    networks:
+      - storage-net
+
+  storage-migrate:
+    build:
+      context: .
+      dockerfile: docker/migrate.Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      storage-db:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - storage-net
+
+  storage-rust:
+    build:
+      context: .
+      dockerfile: docker/rust.Dockerfile
+    environment:
+      STORAGE_PROBLEM_ROOT: ${STORAGE_PROBLEM_ROOT_CONTAINER:-/problems}
+      STORAGE_BIND: 0.0.0.0:8081
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ${STORAGE_PROBLEM_ROOT_HOST:-../clueoj/problems}:${STORAGE_PROBLEM_ROOT_CONTAINER:-/problems}:rw
+    depends_on:
+      storage-db:
+        condition: service_healthy
+      storage-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/internal/health >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - storage-net
+
+  storage-web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+    environment:
+      STORAGE_RUST_BASE_URL: http://storage-rust:8081
+      STORAGE_PORT: 2907
+      STORAGE_PUBLIC_BASE_URL: ${STORAGE_PUBLIC_BASE_URL:-http://localhost:2907}
+      STORAGE_PROBLEM_ROOT_CONTAINER: ${STORAGE_PROBLEM_ROOT_CONTAINER:-/problems}
+    env_file:
+      - path: .env
+        required: false
+    command:
+      - /bin/sh
+      - -eu
+      - -c
+      - |
+        export STORAGE_RUST_INTERNAL_TOKEN="$${STORAGE_INTERNAL_SERVICE_TOKEN:?STORAGE_INTERNAL_SERVICE_TOKEN is required}"
+        exec node dist/index.js
+    ports:
+      - "${STORAGE_PORT:-2907}:2907"
+    depends_on:
+      storage-db:
+        condition: service_healthy
+      storage-migrate:
+        condition: service_completed_successfully
+      storage-rust:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:2907/api/v1/system/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - storage-net
+
+volumes:
+  storage-db-data:
+
+networks:
+  storage-net:
+    driver: bridge

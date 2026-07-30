@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+
+target/
+**/target/
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+*.tsbuildinfo
+
+.git/
+.DS_Store
+docker-compose*.yml
+IMPLEMENTATION_STATUS.md
+README.md

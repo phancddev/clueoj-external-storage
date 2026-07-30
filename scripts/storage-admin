@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+CLUEOJ_DIR="$(cd -- "${APP_DIR}/../clueoj" && pwd)"
+USE_CLUEOJ=false
+
+if [[ "${1:-}" == "--clueoj" ]]; then
+  USE_CLUEOJ=true
+  shift
+fi
+
+compose() {
+  if [[ "${USE_CLUEOJ}" == "true" ]]; then
+    docker compose --project-directory "${CLUEOJ_DIR}" "$@"
+  else
+    docker compose --project-directory "${APP_DIR}" "$@"
+  fi
+}
+
+admin_cli() {
+  if [[ -n "$(compose ps --status running -q storage-web)" ]]; then
+    compose exec -T storage-web node dist/admin-users.js "$@"
+  else
+    compose run --rm -T storage-web node dist/admin-users.js "$@"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./scripts/storage-admin [--clueoj] create <username>
+  ./scripts/storage-admin [--clueoj] passwd <username>
+  ./scripts/storage-admin [--clueoj] delete <username>
+  ./scripts/storage-admin [--clueoj] list
+
+Use --clueoj when the storage services were started from clueoj/docker-compose.yml.
+EOF
+  exit 2
+}
+
+read_password_twice() {
+  local first second
+  read -r -s -p "Password: " first
+  printf '\n'
+  read -r -s -p "Confirm password: " second
+  printf '\n'
+  if [[ "${first}" != "${second}" ]]; then
+    echo "Passwords do not match." >&2
+    exit 1
+  fi
+  if (( ${#first} < 12 )); then
+    echo "Password must be at least 12 characters." >&2
+    exit 1
+  fi
+  STORAGE_ADMIN_PASSWORD="${first}"
+}
+
+command="${1:-}"
+username="${2:-}"
+case "${command}" in
+  create|passwd)
+    [[ -n "${username}" && $# -eq 2 ]] || usage
+    read_password_twice
+    printf '%s\n' "${STORAGE_ADMIN_PASSWORD}" |
+      admin_cli "${command}" "${username}" --password-stdin
+    unset STORAGE_ADMIN_PASSWORD
+    ;;
+  delete)
+    [[ -n "${username}" && $# -eq 2 ]] || usage
+    read -r -p "Delete dashboard administrator '${username}' and revoke all sessions? [y/N] " answer
+    [[ "${answer}" == "y" || "${answer}" == "Y" ]] || {
+      echo "Cancelled."
+      exit 0
+    }
+    admin_cli delete "${username}"
+    ;;
+  list)
+    [[ $# -eq 1 ]] || usage
+    admin_cli list
+    ;;
+  *)
+    usage
+    ;;
+esac

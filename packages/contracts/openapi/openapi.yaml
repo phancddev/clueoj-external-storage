@@ -1,0 +1,1689 @@
+openapi: 3.1.0
+info:
+  title: ClueOJ External Storage API
+  version: 1.0.0
+  description: |
+    Control-plane API for the ClueOJ External Storage system.
+    All timestamps are UTC RFC3339. All byte values are non-negative integers.
+    Mutations require an `Idempotency-Key` header.
+    Authentication via Bearer JWT (HS256, issuer `clueoj-storage`).
+    Roles: viewer, operator, storage-admin, auditor.
+    ClueOJ service account uses separate service tokens with audience+scopes.
+  license:
+    name: AGPL-3.0
+servers:
+  - url: http://storage-web:2907/api/v1
+    description: Docker internal network
+  - url: http://localhost:2907/api/v1
+    description: Local development
+
+tags:
+  - name: System
+    description: Health and system endpoints
+  - name: Auth
+    description: Authentication
+  - name: Storage
+    description: Volume and filesystem metrics
+  - name: Catalog
+    description: Problem catalog reconciliation
+  - name: Sync
+    description: Incremental change sync (ClueOJ pull)
+  - name: Problems
+    description: Problem metadata and usage
+  - name: Organizations
+    description: Organization usage aggregation
+  - name: Snapshots
+    description: R2 snapshot management
+  - name: Jobs
+    description: Background job management
+  - name: Orphans
+    description: Orphan folder detection
+  - name: Audit
+    description: Audit event log
+  - name: Downloads
+    description: Direct R2 download presign
+
+paths:
+  /system/health:
+    get:
+      tags: [System]
+      summary: Health check
+      description: Returns service health including PostgreSQL and Rust data-plane readiness. Rust readiness includes the configured object store.
+      security: []
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Service degraded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Dashboard administrator login
+      description: Authenticate a database-backed dashboard administrator. Returns a revocable JWT for the dashboard.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  minLength: 3
+                  maxLength: 64
+                password:
+                  type: string
+                  format: password
+                  maxLength: 1024
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    description: JWT bearer token
+                  role:
+                    type: string
+                  expires_in:
+                    type: integer
+                  token_type:
+                    type: string
+                    enum: [Bearer]
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /auth/service-token:
+    post:
+      tags: [Auth]
+      summary: Issue a rotating ClueOJ service token
+      description: Storage-admin endpoint for issuing scoped ClueOJ service JWTs. Canonical service scopes are read, mutate, and downloads:issue.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServiceTokenRequest'
+      responses:
+        '200':
+          description: Service token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceTokenResponse'
+
+  /storage/volumes:
+    get:
+      tags: [Storage]
+      summary: List storage volumes
+      description: 'Returns filesystem volume metrics (statvfs: total/free/available bytes).'
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Volume metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedVolume'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /catalog/problems:reconcile:
+    post:
+      tags: [Catalog]
+      summary: Reconcile problem catalog
+      description: |
+        Compare filesystem folders against known problems catalog.
+        Marks orphan (folder no matching Problem), missing (Problem no folder),
+        mirror (folder is a mirror descendant), present.
+        ClueOJ sends its full problem list (external_id=stable PK, code=FS path).
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReconcileRequest'
+      responses:
+        '200':
+          description: Reconcile result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconcileResult'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /catalog/snapshots:schedule:
+    post:
+      tags: [Catalog]
+      summary: Schedule durable scan/snapshot jobs for dirty or no-READY catalog problems
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200': { description: Scheduled jobs }
+
+  /sync/changes:
+    get:
+      tags: [Sync]
+      summary: Get incremental changes
+      description: |
+        Returns changes since the given cursor for ClueOJ to pull.
+        Cursor pagination by observed_at. No offset pagination.
+        ClueOJ commits its cursor after processing, before DB transaction commit.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque pagination cursor from previous response
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 500
+      responses:
+        '200':
+          description: Changes page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncChangesResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /problems:
+    get:
+      tags: [Problems]
+      summary: List problems
+      description: |
+        Search, filter, sort, and cursor-paginate problems.
+        No offset pagination.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: search
+          in: query
+          schema: { type: string }
+          description: Search by code or external_id (ILIKE)
+        - name: owner_organization
+          in: query
+          schema: { type: string }
+          description: Filter by owner organization external_id
+        - name: catalog_state
+          in: query
+          schema: { type: string, enum: [present, orphan, missing, mirror, deleted] }
+        - name: sort
+          in: query
+          schema: { type: string, default: code }
+          description: Sort column (code, external_id, observed_at)
+        - name: order
+          in: query
+          schema: { type: string, enum: [asc, desc], default: asc }
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Problems page
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedProblem'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /problems/{externalId}:
+    get:
+      tags: [Problems]
+      summary: Get problem by external ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: externalId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+          description: Stable external ID (ClueOJ Problem PK)
+      responses:
+        '200':
+          description: Problem
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /problems/{externalId}/usage:
+    get:
+      tags: [Problems]
+      summary: Get problem usage metrics
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: externalId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Usage metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemUsage'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /problems/{externalId}/scan:
+    post:
+      tags: [Problems]
+      summary: Scan problem folder
+      description: Triggers a filesystem scan of the problem folder. Returns job info.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: externalId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProblemActionRequest'
+      responses:
+        '202':
+          description: Scan job created/returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedJobResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /problems/{externalId}/dirty:
+    post:
+      tags: [Problems]
+      summary: Mark problem dirty
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: externalId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DirtyProblemRequest'
+      responses:
+        '200':
+          description: Problem marked dirty
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /problems/{externalId}/ensure-ready:
+    post:
+      tags: [Problems]
+      summary: Ensure local problem folder is present
+      description: Returns ready only if local data is already published. If local data is absent but a READY snapshot exists, enqueues a restore job and returns 202.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: externalId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Local data is ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnsureReadyResponse'
+        '202':
+          description: Restore job accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnsureReadyResponse'
+        '409':
+          description: No local data and no READY snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /problems/{externalId}/snapshot:
+    post:
+      tags: [Problems]
+      summary: Create R2 snapshot
+      description: |
+        Triggers a full-folder immutable snapshot upload to R2.
+        Manifest published last, only after all objects uploaded+verified.
+        Generation READY only after verify. Fencing token prevents old task overwrite.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: externalId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProblemActionRequest'
+      responses:
+        '202':
+          description: Snapshot job created/returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedJobResponse'
+        '409':
+          description: Fencing mismatch (newer generation in progress)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /problems/{externalId}/restore:
+    post:
+      tags: [Problems]
+      summary: Restore from R2 snapshot
+      description: |
+        Downloads objects from R2 and rebuilds the problem folder per manifest.
+        Atomic temp+rename+fsync. SHA-256 verify each object.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: externalId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProblemActionRequest'
+      responses:
+        '200':
+          description: Restore dry-run result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestoreDryRunResponse'
+        '202':
+          description: Restore job created/returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedJobResponse'
+        '409':
+          description: Fencing mismatch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /problems/{externalId}/evict:
+    post:
+      tags: [Problems]
+      summary: Evict local files
+      description: |
+        Removes local problem files when R2 generation is READY+verified.
+        Eviction default OFF. Dry-run required unless force=true.
+        Preserves init.yml for judge routing.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: externalId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProblemActionRequest'
+      responses:
+        '202':
+          description: Evict job created/returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedJobResponse'
+        '409':
+          description: Fencing mismatch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /organizations:
+    get:
+      tags: [Organizations]
+      summary: List organizations with usage
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Organizations page
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedOrganizationUsage'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /organizations/{externalId}/usage:
+    get:
+      tags: [Organizations]
+      summary: Get organization usage
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: externalId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Organization usage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrganizationUsage'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /snapshots:
+    get:
+      tags: [Snapshots]
+      summary: List snapshots
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: problem_id
+          in: query
+          schema: { type: string }
+          description: Filter by problem external ID
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Snapshots page
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedSnapshot'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /snapshots/{id}:
+    get:
+      tags: [Snapshots]
+      summary: Get snapshot by ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Snapshot'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /jobs:
+    get:
+      tags: [Jobs]
+      summary: List jobs
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: state
+          in: query
+          schema: { type: string, enum: [pending, running, completed, failed, cancelled] }
+        - name: problem_id
+          in: query
+          schema: { type: string }
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Jobs page
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedJob'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /jobs/{id}:
+    get:
+      tags: [Jobs]
+      summary: Get job by ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /jobs/{id}/events:
+    get:
+      tags: [Jobs]
+      summary: Job status SSE stream
+      description: Snapshot stream that emits the current job immediately, then job updates every second and heartbeat events every 15 seconds. Dashboard must use authenticated fetch streaming with Bearer auth; JWT query tokens are intentionally not supported. Last-Event-ID is accepted as a client reconnect marker; server always sends current state first.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: text/event-stream with job and heartbeat events
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /jobs/{id}/retry:
+    post:
+      tags: [Jobs]
+      summary: Retry a failed/cancelled job
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobActionRequest'
+      responses:
+        '200':
+          description: Job retried
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '409':
+          description: Job not retryable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /jobs/{id}/cancel:
+    post:
+      tags: [Jobs]
+      summary: Cancel a pending/running job
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobActionRequest'
+      responses:
+        '200':
+          description: Job cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '409':
+          description: Job not cancellable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /orphans:
+    get:
+      tags: [Orphans]
+      summary: List orphan folders
+      description: Folders on disk with no matching Problem in catalog.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Orphans list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Orphan'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /audit-events:
+    get:
+      tags: [Audit]
+      summary: List audit events
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: actor
+          in: query
+          schema: { type: string }
+        - name: action
+          in: query
+          schema: { type: string }
+        - name: problem_id
+          in: query
+          schema: { type: string }
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Audit events page
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedAuditEvent'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /downloads:
+    post:
+      tags: [Downloads]
+      summary: Presign R2 download URL
+      description: |
+        Resolves latest READY canonical artifact and signs a short-TTL R2 GET URL.
+        Default TTL 180s, max 300s. Content-Disposition: attachment.
+        NO byte proxy through control plane or Rust. Browser downloads directly from R2.
+        ClueOJ calls this with service auth after checking user download permission.
+        No client-supplied object keys. No permanent presigned URL stored.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DownloadRequest'
+      responses:
+        '200':
+          description: Presigned download URL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadResponse'
+        '404':
+          description: No ready snapshot or artifact
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /backfill:
+    get:
+      tags: [Operations]
+      summary: List backfill states
+      security:
+        - bearerAuth: []
+      responses:
+        '200': { description: Backfill states }
+
+  /backfill/{capability}/start:
+    post:
+      tags: [Operations]
+      summary: Start or resume cursor backfill
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: capability
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: Backfill worker job accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedJobResponse'
+
+  /backfill/{capability}/pause:
+    post:
+      tags: [Operations]
+      summary: Pause cursor backfill
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: capability
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200': { description: Backfill paused }
+
+  /backfill/{capability}/progress:
+    get:
+      tags: [Operations]
+      summary: Get backfill progress
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: capability
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Backfill progress }
+
+  /incident-commands:
+    get:
+      tags: [Operations]
+      summary: List incident command history
+      security:
+        - bearerAuth: []
+      responses:
+        '200': { description: Incident commands }
+    post:
+      tags: [Operations]
+      summary: Execute supported incident command
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200': { description: Command result }
+        '501':
+          description: Command requires external infrastructure and was not executed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /retention:
+    get:
+      tags: [Operations]
+      summary: List retention config
+      security:
+        - bearerAuth: []
+      responses:
+        '200': { description: Retention config }
+
+  /organizations/{externalId}/settings:
+    put:
+      tags: [Organizations]
+      summary: Update organization storage quota settings
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: externalId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200': { description: Organization settings updated }
+
+  /dashboard/summary:
+    get:
+      tags: [Operations]
+      summary: Dashboard summary metrics
+      security:
+        - bearerAuth: []
+      responses:
+        '200': { description: Summary metrics }
+
+  /dashboard/status-distribution:
+    get:
+      tags: [Operations]
+      summary: Dashboard status distributions
+      security:
+        - bearerAuth: []
+      responses:
+        '200': { description: Status distributions }
+
+  /dashboard/largest-problems:
+    get:
+      tags: [Operations]
+      summary: Largest problems by logical bytes
+      security:
+        - bearerAuth: []
+      responses:
+        '200': { description: Largest problems }
+
+  /dashboard/largest-organizations:
+    get:
+      tags: [Operations]
+      summary: Largest organizations by logical bytes
+      security:
+        - bearerAuth: []
+      responses:
+        '200': { description: Largest organizations }
+
+  /dashboard/volume-timeseries:
+    get:
+      tags: [Operations]
+      summary: Volume observation history
+      security:
+        - bearerAuth: []
+      responses:
+        '200': { description: Volume time series }
+
+  /retention/{entityType}:
+    put:
+      tags: [Operations]
+      summary: Update retention config
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: entityType
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200': { description: Retention config updated }
+
+  /retention:apply:
+    post:
+      tags: [Operations]
+      summary: Apply retention policy
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200': { description: Retention deletion counts }
+
+  /gc/eligible:
+    get:
+      tags: [Operations]
+      summary: List GC-eligible objects after live-ref check
+      security:
+        - bearerAuth: []
+      responses:
+        '200': { description: Eligible objects }
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+      description: Unique key for idempotent mutation requests
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Bearer JWT token (HS256, issuer clueoj-storage)
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [code, message, retryable, request_id]
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code
+        message:
+          type: string
+          description: Human-readable error message
+        retryable:
+          type: boolean
+        request_id:
+          type: string
+
+    HealthResponse:
+      type: object
+      required: [status, version, database, rust_data_plane]
+      properties:
+        status: { type: string }
+        version: { type: string }
+        database: { type: boolean }
+        rust_data_plane: { type: boolean }
+
+    Volume:
+      type: object
+      required: [name, mount_path, total_bytes, free_bytes, available_bytes, observed_at, stale]
+      properties:
+        name: { type: string }
+        mount_path: { type: string }
+        total_bytes: { type: integer, minimum: 0 }
+        free_bytes: { type: integer, minimum: 0 }
+        available_bytes: { type: integer, minimum: 0 }
+        observed_at: { type: string, format: date-time }
+        stale: { type: boolean }
+
+    Problem:
+      type: object
+      required: [external_id, code, owner_organization, is_manually_managed, mirror_of, mirror_root, quota_bytes, catalog_state, dirty, dirty_generation, dirty_version, observed_at, stale]
+      properties:
+        external_id:
+          type: string
+          description: Stable external ID (ClueOJ Problem PK)
+        code:
+          type: string
+          description: Mutable problem code used as filesystem path
+        owner_organization:
+          type: string
+          nullable: true
+        is_manually_managed: { type: boolean }
+        mirror_of:
+          type: string
+          nullable: true
+        mirror_root:
+          type: string
+          nullable: true
+        quota_bytes:
+          type: integer
+          nullable: true
+          minimum: 0
+        catalog_state:
+          type: string
+          enum: [present, orphan, missing, mirror, deleted]
+        dirty: { type: boolean }
+        dirty_generation:
+          type: integer
+          nullable: true
+          minimum: 0
+        dirty_version:
+          type: integer
+          minimum: 0
+        observed_at: { type: string, format: date-time }
+        stale: { type: boolean }
+
+    ProblemUsage:
+      type: object
+      required: [problem_id, logical_bytes, allocated_bytes, archive_bytes, auxiliary_bytes, file_count, local_status, r2_status, snapshot_generation, orphan_bytes, referenced_bytes, quota_bytes, observed_at, stale]
+      properties:
+        problem_id: { type: string }
+        logical_bytes: { type: integer, minimum: 0 }
+        allocated_bytes: { type: integer, minimum: 0 }
+        archive_bytes: { type: integer, minimum: 0 }
+        auxiliary_bytes: { type: integer, minimum: 0 }
+        file_count: { type: integer, minimum: 0 }
+        local_status:
+          type: string
+          enum: [present, missing, partial, orphan]
+        r2_status:
+          type: string
+          enum: [none, uploading, ready, error, superseded]
+        snapshot_generation:
+          type: integer
+          nullable: true
+          minimum: 0
+        orphan_bytes: { type: integer, minimum: 0 }
+        referenced_bytes: { type: integer, minimum: 0 }
+        quota_bytes:
+          type: integer
+          nullable: true
+          minimum: 0
+        observed_at: { type: string, format: date-time }
+        stale: { type: boolean }
+
+    OrganizationUsage:
+      type: object
+      required: [organization_id, problem_count, logical_bytes, allocated_bytes, archive_bytes, auxiliary_bytes, referenced_bytes, quota_bytes, problem_count_quota, observed_at, stale]
+      properties:
+        organization_id: { type: string }
+        problem_count: { type: integer, minimum: 0 }
+        logical_bytes: { type: integer, minimum: 0 }
+        allocated_bytes: { type: integer, minimum: 0 }
+        archive_bytes: { type: integer, minimum: 0 }
+        auxiliary_bytes: { type: integer, minimum: 0 }
+        referenced_bytes: { type: integer, minimum: 0 }
+        quota_bytes:
+          type: integer
+          nullable: true
+          minimum: 0
+        problem_count_quota:
+          type: integer
+          nullable: true
+          minimum: 0
+        observed_at: { type: string, format: date-time }
+        stale: { type: boolean }
+
+    Snapshot:
+      type: object
+      required: [id, problem_id, generation, state, file_count, total_bytes, manifest_key, error_code, error_message, created_at, completed_at]
+      properties:
+        id: { type: string, format: uuid }
+        problem_id: { type: string }
+        generation: { type: integer, minimum: 0 }
+        state:
+          type: string
+          enum: [discovered, hashing, uploading, verifying, ready, error, superseded]
+        file_count: { type: integer, minimum: 0 }
+        total_bytes: { type: integer, minimum: 0 }
+        manifest_key:
+          type: string
+          nullable: true
+        error_code:
+          type: string
+          nullable: true
+        error_message:
+          type: string
+          nullable: true
+        created_at: { type: string, format: date-time }
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    Job:
+      type: object
+      required: [id, idempotency_key, job_type, problem_id, target_generation, state, lease_owner, lease_expires_at, fencing_token, attempt, max_attempts, result, error_code, error_message, created_at, updated_at, completed_at]
+      properties:
+        id: { type: string, format: uuid }
+        idempotency_key: { type: string }
+        job_type:
+          type: string
+          enum: [scan, snapshot, restore, evict, reconcile, backfill, gc_collect, incident_command]
+        problem_id:
+          type: string
+          nullable: true
+        target_generation:
+          type: integer
+          nullable: true
+          minimum: 0
+        state:
+          type: string
+          enum: [pending, running, completed, failed, cancelled]
+        lease_owner:
+          type: string
+          nullable: true
+        lease_expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        fencing_token: { type: integer, minimum: 0 }
+        attempt: { type: integer, minimum: 0 }
+        max_attempts: { type: integer, minimum: 1 }
+        result: {}
+        error_code:
+          type: string
+          nullable: true
+        error_message:
+          type: string
+          nullable: true
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    AuditEvent:
+      type: object
+      required: [id, actor, actor_role, action, target_type, target_id, problem_id, generation, job_id, metadata, request_id, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        actor: { type: string }
+        actor_role:
+          type: string
+          nullable: true
+        action: { type: string }
+        target_type:
+          type: string
+          nullable: true
+        target_id:
+          type: string
+          nullable: true
+        problem_id:
+          type: string
+          nullable: true
+        generation:
+          type: integer
+          nullable: true
+        job_id:
+          type: string
+          nullable: true
+        metadata:
+          type: object
+          additionalProperties: true
+        request_id:
+          type: string
+          nullable: true
+        created_at: { type: string, format: date-time }
+
+    DownloadRequest:
+      type: object
+      required: [problem_external_id]
+      properties:
+        problem_external_id:
+          type: string
+          description: Stable external ID (ClueOJ Problem PK)
+        ttl_seconds:
+          type: integer
+          minimum: 1
+          maximum: 300
+          default: 180
+
+    DownloadResponse:
+      type: object
+      required: [url, expires_at, method]
+      properties:
+        url: { type: string }
+        expires_at: { type: string, format: date-time }
+        method:
+          type: string
+          enum: [GET]
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+
+    Orphan:
+      type: object
+      required: [code, logical_bytes, allocated_bytes, file_count, observed_at]
+      properties:
+        code: { type: string }
+        logical_bytes: { type: integer, minimum: 0 }
+        allocated_bytes: { type: integer, minimum: 0 }
+        file_count: { type: integer, minimum: 0 }
+        observed_at: { type: string, format: date-time }
+
+    SyncChange:
+      type: object
+      required: [external_id, code, owner_organization, is_manually_managed, mirror_of, mirror_root, catalog_state, event_kind, schema_version, downloadable, quota_bytes, logical_bytes, allocated_bytes, archive_bytes, auxiliary_bytes, file_count, local_status, r2_status, snapshot_generation, orphan_bytes, referenced_bytes, observed_at, stale, updated_at]
+      properties:
+        external_id: { type: string }
+        code: { type: string }
+        owner_organization:
+          type: string
+          nullable: true
+        is_manually_managed: { type: boolean }
+        mirror_of:
+          type: string
+          nullable: true
+        mirror_root:
+          type: string
+          nullable: true
+        catalog_state: { type: string }
+        event_kind:
+          type: string
+          enum: [upsert, delete]
+        schema_version: { type: integer, minimum: 1 }
+        downloadable: { type: boolean }
+        quota_bytes:
+          type: integer
+          nullable: true
+          minimum: 0
+        logical_bytes: { type: integer, minimum: 0 }
+        allocated_bytes: { type: integer, minimum: 0 }
+        archive_bytes: { type: integer, minimum: 0 }
+        auxiliary_bytes: { type: integer, minimum: 0 }
+        file_count: { type: integer, minimum: 0 }
+        local_status: { type: string }
+        r2_status: { type: string }
+        snapshot_generation:
+          type: integer
+          nullable: true
+        orphan_bytes: { type: integer, minimum: 0 }
+        referenced_bytes: { type: integer, minimum: 0 }
+        observed_at: { type: string, format: date-time }
+        stale: { type: boolean }
+        updated_at: { type: string, format: date-time }
+
+    SyncChangesResponse:
+      type: object
+      required: [schema_version, changes, next_cursor, has_more]
+      properties:
+        schema_version: { type: integer, minimum: 1 }
+        changes:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncChange'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more: { type: boolean }
+
+    ReconcileRequest:
+      type: object
+      required: [problems]
+      properties:
+        problems:
+          type: array
+          items:
+            type: object
+            required: [external_id, code]
+            properties:
+              external_id: { type: string }
+              code: { type: string }
+              owner_external_id:
+                type: string
+                nullable: true
+              owner_organization:
+                type: string
+                nullable: true
+              owner_organization_id:
+                oneOf:
+                  - type: string
+                  - type: number
+                  - type: 'null'
+              is_manually_managed: { type: boolean }
+              mirror_root_external_id:
+                type: string
+                nullable: true
+              mirror_of_external_id:
+                type: string
+                nullable: true
+              mirror_of:
+                type: string
+                nullable: true
+              problem_pk:
+                oneOf:
+                  - type: string
+                  - type: number
+              quota_bytes:
+                type: integer
+                nullable: true
+                minimum: 0
+              schema_version:
+                type: integer
+                minimum: 1
+
+    ReconcileResult:
+      type: object
+      required: [discovered, present, missing, orphan, mirror]
+      properties:
+        discovered: { type: integer, minimum: 0 }
+        present: { type: integer, minimum: 0 }
+        missing: { type: integer, minimum: 0 }
+        orphan: { type: integer, minimum: 0 }
+        mirror: { type: integer, minimum: 0 }
+
+    ProblemActionRequest:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+          default: false
+        generation:
+          type: integer
+          minimum: 0
+
+    JobActionRequest:
+      type: object
+      properties:
+        reason: { type: string }
+
+    DirtyProblemRequest:
+      type: object
+      required: [code]
+      properties:
+        external_id: { type: string }
+        problem_pk:
+          oneOf:
+            - type: string
+            - type: number
+        code: { type: string }
+        owner_organization:
+          type: string
+          nullable: true
+        owner_organization_id:
+          oneOf:
+            - type: string
+            - type: number
+            - type: 'null'
+        owner_external_id:
+          type: string
+          nullable: true
+        is_manually_managed: { type: boolean }
+        mirror_of:
+          type: string
+          nullable: true
+        mirror_of_external_id:
+          type: string
+          nullable: true
+        mirror_root:
+          type: string
+          nullable: true
+        mirror_root_external_id:
+          type: string
+          nullable: true
+        quota_bytes:
+          type: integer
+          nullable: true
+          minimum: 0
+        schema_version:
+          type: integer
+          minimum: 1
+        event_kind:
+          type: string
+          enum: [upsert, delete]
+        catalog_state:
+          type: string
+          enum: [present, orphan, missing, mirror, deleted]
+
+    EnsureReadyResponse:
+      type: object
+      required: [status, ready]
+      properties:
+        status:
+          type: string
+          enum: [ready, restoring, snapshotting, unavailable]
+        ready: { type: boolean }
+        job_id: { type: string }
+        poll_url: { type: string }
+        events_url: { type: string }
+
+    ServiceTokenRequest:
+      type: object
+      properties:
+        subject: { type: string }
+        scopes:
+          type: array
+          items: { type: string }
+        ttl_seconds:
+          type: integer
+          minimum: 60
+          maximum: 2592000
+
+    ServiceTokenResponse:
+      type: object
+      required: [token, expires_in, token_type, audience, scopes]
+      properties:
+        token: { type: string }
+        expires_in: { type: integer }
+        token_type:
+          type: string
+          enum: [Bearer]
+        audience: { type: string }
+        scopes:
+          type: array
+          items: { type: string }
+
+    AcceptedJobResponse:
+      type: object
+      required: [job_id, state, poll_url, events_url]
+      properties:
+        job_id: { type: string, format: uuid }
+        state:
+          type: string
+          enum: [pending, running, completed, failed, cancelled]
+        poll_url: { type: string }
+        events_url: { type: string }
+
+    RestoreDryRunResponse:
+      type: object
+      properties:
+        dry_run: { const: true }
+        message: { type: string }
+      required: [dry_run, message]
+
+    PaginatedProblem:
+      type: object
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Problem'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more: { type: boolean }
+
+    PaginatedVolume:
+      type: object
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Volume'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more: { type: boolean }
+
+    PaginatedOrganizationUsage:
+      type: object
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrganizationUsage'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more: { type: boolean }
+
+    PaginatedSnapshot:
+      type: object
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Snapshot'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more: { type: boolean }
+
+    PaginatedJob:
+      type: object
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Job'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more: { type: boolean }
+
+    PaginatedAuditEvent:
+      type: object
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more: { type: boolean }

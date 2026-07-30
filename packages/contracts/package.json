@@ -1,0 +1,11 @@
+{
+  "name": "@clueoj-storage/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./generated/client.ts",
+  "exports": {
+    ".": "./generated/client.ts",
+    "./openapi": "./openapi/openapi.yaml"
+  }
+}

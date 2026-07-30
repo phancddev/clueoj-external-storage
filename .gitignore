@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+
+target/
+node_modules/
+dist/
+*.tsbuildinfo
+dashboard/vite.config.js
+dashboard/vite.config.d.ts
+.DS_Store
