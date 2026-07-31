@@ -55,6 +55,9 @@ Copy `.env.example` to `.env` and fill in:
 - `STORAGE_PORT` — dashboard/API port (default `2907`)
 - `STORAGE_DATABASE_URL` — PostgreSQL connection string
 - `STORAGE_PUBLIC_BASE_URL` — public URL for dashboard
+- `STORAGE_EVICTION_ENABLED` and `STORAGE_LOCAL_EVICTION_ENABLED` — both must
+  be `true` to enable passive local-test eviction; the default idle window is
+  24 hours after the latest submission or latest local restore/snapshot
 - `STORAGE_CLUEOJ_SERVICE_AUDIENCE` — JWT audience for ClueOJ service
 - `STORAGE_CLUEOJ_SERVICE_SECRET` — shared secret used by ClueOJ to mint short-lived service JWTs
 - `STORAGE_SERVICE_SCOPES` — ClueOJ service scopes, default `read,mutate,downloads:issue`

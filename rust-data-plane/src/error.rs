@@ -19,6 +19,10 @@ pub enum AppError {
     EvictionDisabled,
     #[error("eviction requires dry_run unless explicitly forced")]
     EvictionDryRunRequired,
+    #[error("problem was accessed after the automatic eviction cutoff")]
+    EvictionRecentlyAccessed,
+    #[error("problem has unsnapshotted local changes")]
+    EvictionDirty,
     #[error("r2 generation not ready+verified for problem {0}")]
     R2NotReady(String),
     #[error("internal token missing or invalid")]
@@ -75,6 +79,10 @@ impl AppError {
             AppError::EvictionDryRunRequired => {
                 (StatusCode::BAD_REQUEST, "EVICTION_DRY_RUN_REQUIRED", false)
             }
+            AppError::EvictionRecentlyAccessed => {
+                (StatusCode::CONFLICT, "EVICTION_RECENTLY_ACCESSED", true)
+            }
+            AppError::EvictionDirty => (StatusCode::CONFLICT, "EVICTION_DIRTY", true),
             AppError::R2NotReady(_) => (StatusCode::CONFLICT, "R2_NOT_READY", true),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", false),
             AppError::ObjectNotFound(_) => (StatusCode::NOT_FOUND, "OBJECT_NOT_FOUND", false),

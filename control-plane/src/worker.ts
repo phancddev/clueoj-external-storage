@@ -155,9 +155,16 @@ export class JobWorker {
     if (!job.problem_id) throw new Error('evict job requires problem_id');
     const problem = await db.getProblem(this.ctx.pool, job.problem_id);
     if (!problem) throw new Error(`Problem not found: ${job.problem_id}`);
-    const opts = (job.result ?? {}) as { dry_run?: boolean; force?: boolean };
+    const opts = (job.result ?? {}) as { dry_run?: boolean; force?: boolean; idle_before?: string };
     await guard();
-    return this.ctx.rust.evict(problem.external_id, problem.code, opts.dry_run ?? true, opts.force ?? false, job.fencing_token);
+    return this.ctx.rust.evict(
+      problem.external_id,
+      problem.code,
+      opts.dry_run ?? true,
+      opts.force ?? false,
+      job.fencing_token,
+      opts.idle_before,
+    );
   }
 
   private async reconcile(_job: JobT): Promise<unknown> {

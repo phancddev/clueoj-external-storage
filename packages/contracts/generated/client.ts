@@ -207,6 +207,9 @@ export interface ReconcileResult {
 export interface ProblemActionRequest {
   dry_run?: boolean;
   generation?: number;
+  force?: boolean;
+  idle_before?: string;
+  reason?: string;
 }
 
 export interface JobActionRequest {

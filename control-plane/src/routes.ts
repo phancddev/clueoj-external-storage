@@ -454,6 +454,16 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
     const { externalId } = req.params as { externalId: string };
     const problem = await db.getProblem(ctx.pool, externalId);
     if (!problem) return reply.code(404).send({ code: 'not_found', message: 'Problem not found', retryable: false, request_id: getRequestId(req) });
+    try {
+      await db.touchProblemAccess(ctx.pool, externalId);
+    } catch (err) {
+      return reply.code(503).send({
+        code: 'access_fence_failed',
+        message: (err as Error).message,
+        retryable: true,
+        request_id: getRequestId(req),
+      });
+    }
     let actual;
     try {
       actual = await ctx.rust.ready(externalId, problem.code);
@@ -600,7 +610,33 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
   app.post('/api/v1/problems/:externalId/evict', { schema: { response: { 202: AcceptedJobResponse, default: ErrorResponse } } }, async (req, reply) => {
     if (!requireScopes(req, reply, 'mutate')) return;
     const { externalId } = req.params as { externalId: string };
-    const body = (req.body as { dry_run?: boolean; force?: boolean }) || {};
+    const body = (req.body as {
+      dry_run?: boolean;
+      force?: boolean;
+      idle_before?: string;
+      reason?: string;
+    }) || {};
+    let idleBefore: string | undefined;
+    if (body.idle_before !== undefined) {
+      const parsed = new Date(body.idle_before);
+      if (!Number.isFinite(parsed.getTime())) {
+        return reply.code(400).send({
+          code: 'bad_request',
+          message: 'idle_before must be an RFC3339 timestamp',
+          retryable: false,
+          request_id: getRequestId(req),
+        });
+      }
+      if (parsed.getTime() > Date.now()) {
+        return reply.code(400).send({
+          code: 'bad_request',
+          message: 'idle_before cannot be in the future',
+          retryable: false,
+          request_id: getRequestId(req),
+        });
+      }
+      idleBefore = parsed.toISOString();
+    }
     const problem = await db.getProblem(ctx.pool, externalId);
     if (!problem) return reply.code(404).send({ code: 'not_found', message: 'Problem not found', retryable: false, request_id: getRequestId(req) });
     try {
@@ -608,10 +644,29 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
       if (!idempotencyKey) return;
       const job = await db.createJob(ctx.pool, {
         idempotencyKey, jobType: 'evict', problemId: externalId, targetGeneration: null, leaseOwner: getAuth(req).sub,
-        requestFingerprint: db.stableFingerprint({ action: 'evict', external_id: externalId, dry_run: body.dry_run ?? true, force: body.force ?? false }),
+        requestFingerprint: db.stableFingerprint({
+          action: 'evict',
+          external_id: externalId,
+          dry_run: body.dry_run ?? true,
+          force: body.force ?? false,
+          idle_before: idleBefore ?? null,
+        }),
       });
-      await db.setJobPayload(ctx.pool, job.id, { dry_run: body.dry_run ?? true, force: body.force ?? false });
-      await audit(ctx, req, 'problem.evict', { problemId: externalId, jobId: job.id, metadata: { dry_run: body.dry_run ?? true } });
+      await db.setJobPayload(ctx.pool, job.id, {
+        dry_run: body.dry_run ?? true,
+        force: body.force ?? false,
+        idle_before: idleBefore,
+        reason: body.reason,
+      });
+      await audit(ctx, req, 'problem.evict', {
+        problemId: externalId,
+        jobId: job.id,
+        metadata: {
+          dry_run: body.dry_run ?? true,
+          idle_before: idleBefore,
+          reason: body.reason,
+        },
+      });
       reply.code(202).send(accepted(job));
     } catch (err) {
       sendJobError(reply, err, getRequestId(req));

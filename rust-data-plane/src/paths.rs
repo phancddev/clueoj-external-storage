@@ -1,6 +1,55 @@
+use std::fs::{File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
+
+pub struct ProblemDataLock {
+    file: File,
+}
+
+impl Drop for ProblemDataLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN);
+        }
+    }
+}
+
+/// Acquire the same advisory filesystem lock used by ClueOJ's Python writers.
+///
+/// Destructive restore/evict operations hold this lock while renaming the
+/// problem directory, preventing an upload from being published into a folder
+/// that is concurrently being replaced or removed.
+pub fn lock_problem_data(root: &Path, problem_id: &str) -> AppResult<ProblemDataLock> {
+    let sanitized: String = format!("problem:{problem_id}")
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let lock_root = root.join(".locks");
+    std::fs::create_dir_all(&lock_root)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_root.join(format!("{sanitized}.lock")))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(AppError::Io(std::io::Error::last_os_error()));
+        }
+    }
+    Ok(ProblemDataLock { file })
+}
 
 pub fn validate_relative_path(path: &str) -> AppResult<()> {
     let p = Path::new(path);

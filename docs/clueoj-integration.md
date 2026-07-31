@@ -80,6 +80,27 @@ curl --fail http://127.0.0.1:2907/api/v1/system/health
 
 The dashboard is available on port `2907`.
 
+### Passive local-test eviction
+
+After migrations are applied and `ensure-ready` restore is verified, enable:
+
+```dotenv
+STORAGE_EVICTION_ENABLED=true
+STORAGE_LOCAL_EVICTION_ENABLED=true
+STORAGE_ENSURE_READY_ENABLED=true
+STORAGE_LOCAL_EVICTION_IDLE_HOURS=24
+STORAGE_LOCAL_EVICTION_BATCH_SIZE=50
+STORAGE_LOCAL_EVICTION_SWEEP_SECONDS=3600
+```
+
+Celery Beat performs one indexed, bounded sweep per interval. It does not
+create a timer for each submission. A problem becomes eligible only when its
+latest local restore/snapshot and its latest direct or mirror submission are
+both older than the idle window, with no queued/running grading submission.
+`ensure-ready` refreshes a storage-side access fence, so a submission racing
+the eviction cancels it or waits for the completed eviction and restores the
+single READY R2 generation.
+
 ## 3. Give ClueOJ network access
 
 The storage API publishes host port `2907`. On Docker Desktop, ClueOJ

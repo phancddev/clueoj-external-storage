@@ -29,6 +29,7 @@ describe.runIf(enabled)('PostgreSQL concurrency contracts', () => {
       '006_problem_identity_rekey.sql',
       '007_active_job_guards.sql',
       '008_snapshot_retention_gc.sql',
+      '009_passive_local_eviction.sql',
     ]) {
       if (name === '008_snapshot_retention_gc.sql') {
         await pool.query(
@@ -120,6 +121,41 @@ describe.runIf(enabled)('PostgreSQL concurrency contracts', () => {
       leaseOwner: 'test',
       requestFingerprint: 'same-restore',
     })).rejects.toBeInstanceOf(db.IdempotencyConflictError);
+  });
+
+  it('touches problem access and cancels a pending eviction under the problem fence', async () => {
+    await pool.query(
+      `INSERT INTO problems (external_id, code, catalog_state)
+       VALUES ('p-access-fence', 'access-fence', 'present')`,
+    );
+    await pool.query(
+      `INSERT INTO problem_usage
+         (problem_id, local_status, r2_status, last_accessed_at, stale)
+       VALUES
+         ('p-access-fence', 'present', 'ready', now() - interval '2 days', false)`,
+    );
+    await pool.query(
+      `INSERT INTO jobs
+         (idempotency_key, job_type, problem_id, state, request_fingerprint)
+       VALUES
+         ('pending-eviction', 'evict', 'p-access-fence', 'pending', 'fence-test')`,
+    );
+
+    await db.touchProblemAccess(pool, 'p-access-fence');
+
+    const usage = await pool.query(
+      `SELECT last_accessed_at > now() - interval '1 minute' AS recently_accessed
+       FROM problem_usage WHERE problem_id = 'p-access-fence'`,
+    );
+    const job = await pool.query(
+      `SELECT state, error_code FROM jobs
+       WHERE idempotency_key = 'pending-eviction'`,
+    );
+    expect(usage.rows[0].recently_accessed).toBe(true);
+    expect(job.rows[0]).toMatchObject({
+      state: 'cancelled',
+      error_code: 'problem_became_active',
+    });
   });
 
   it('repairs legacy duplicate READY generations and enforces one authoritative snapshot', async () => {

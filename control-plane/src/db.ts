@@ -1112,6 +1112,45 @@ export async function createRestoreJobIfMissing(
   }
 }
 
+export async function touchProblemAccess(pool: Pool, problemId: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // This is the same lock namespace held by the Rust destructive eviction
+    // transaction. A concurrent submission either updates the fence first or
+    // waits for eviction to finish and then observes/restores the missing copy.
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1, 2907))`,
+      [problemId],
+    );
+    await client.query(
+      `UPDATE problem_usage
+       SET last_accessed_at = now()
+       WHERE problem_id = $1`,
+      [problemId],
+    );
+    await client.query(
+      `UPDATE jobs
+       SET state = 'cancelled',
+           error_code = 'problem_became_active',
+           error_message = 'Cancelled because ensure-ready observed new problem activity',
+           completed_at = now(),
+           lease_owner = NULL,
+           lease_expires_at = NULL
+       WHERE problem_id = $1
+         AND job_type = 'evict'
+         AND state = 'pending'`,
+      [problemId],
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 export async function allocateGeneration(pool: Pool, problemId: string): Promise<number> {
   return allocateGenerationOnClient(pool, problemId);
 }

@@ -520,9 +520,11 @@ paths:
       tags: [Problems]
       summary: Evict local files
       description: |
-        Removes local problem files when R2 generation is READY+verified.
+        Atomically removes the complete local problem folder when its R2
+        generation is READY+verified and no unsnapshotted changes exist.
         Eviction default OFF. Dry-run required unless force=true.
-        Preserves init.yml for judge routing.
+        Automatic callers should supply idle_before; ensure-ready access after
+        that cutoff fences the eviction.
       security:
         - bearerAuth: []
       parameters:
@@ -1500,6 +1502,14 @@ components:
         generation:
           type: integer
           minimum: 0
+        force:
+          type: boolean
+          default: false
+        idle_before:
+          type: string
+          format: date-time
+        reason:
+          type: string
 
     JobActionRequest:
       type: object

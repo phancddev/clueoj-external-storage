@@ -63,6 +63,8 @@ class FakePool {
 }
 
 class EnsureReadyPool {
+  accessTouches = 0;
+
   constructor(private mode: 'ready' | 'restore' | 'unavailable' | 'snapshotting' | 'terminal' | 'partial-clean' | 'partial-dirty') {}
   async connect() {
     return {
@@ -74,6 +76,10 @@ class EnsureReadyPool {
     const dashboardUser = dashboardUserResult(sql, params);
     if (dashboardUser) return dashboardUser;
     if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [], rowCount: 0 };
+    if (sql.includes('SET last_accessed_at = now()')) {
+      this.accessTouches += 1;
+      return { rows: [], rowCount: 1 };
+    }
     if (sql.includes('pg_advisory_xact_lock') && !sql.includes('INSERT INTO jobs')) {
       return { rows: [{}], rowCount: 1 };
     }
@@ -466,7 +472,8 @@ describe('runtime route contracts', () => {
 
   it('ensure-ready returns ready only when local is already present', async () => {
     const app = Fastify({ logger: false });
-    await buildRoutes(app, { pool: new EnsureReadyPool('ready') as any, env, rust: rustByMode('ready') as any });
+    const pool = new EnsureReadyPool('ready');
+    await buildRoutes(app, { pool: pool as any, env, rust: rustByMode('ready') as any });
     const token = await signOperatorToken(env.dashboardJwtSecret, 'admin', 'operator', 60, env.dashboardJwtAudience);
     const res = await app.inject({
       method: 'POST',
@@ -475,6 +482,21 @@ describe('runtime route contracts', () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ status: 'ready', ready: true });
+    expect(pool.accessTouches).toBe(1);
+  });
+
+  it('rejects a malformed automatic eviction cutoff before creating a job', async () => {
+    const app = Fastify({ logger: false });
+    await buildRoutes(app, { pool: new EnsureReadyPool('ready') as any, env, rust: rustByMode('ready') as any });
+    const token = await signOperatorToken(env.dashboardJwtSecret, 'admin', 'operator', 60, env.dashboardJwtAudience);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/problems/p1/evict',
+      headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'idem-evict-invalid' },
+      payload: { dry_run: false, force: true, idle_before: 'not-a-date' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ code: 'bad_request', retryable: false });
   });
 
   it('ensure-ready enqueues restore when local is absent but READY snapshot exists', async () => {

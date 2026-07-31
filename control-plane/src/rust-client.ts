@@ -144,8 +144,22 @@ export class RustClient {
     return this.getJson(`/internal/ready?problem_external_id=${encodeURIComponent(problemExternalId)}&code=${encodeURIComponent(code)}`, 8000);
   }
 
-  async evict(problemExternalId: string, code: string, dryRun: boolean, force: boolean, fencingToken: number): Promise<RustEvictResult> {
-    return this.post('/internal/evict', { problem_external_id: problemExternalId, code, dry_run: dryRun, force, fencing_token: fencingToken });
+  async evict(
+    problemExternalId: string,
+    code: string,
+    dryRun: boolean,
+    force: boolean,
+    fencingToken: number,
+    idleBefore?: string,
+  ): Promise<RustEvictResult> {
+    return this.post('/internal/evict', {
+      problem_external_id: problemExternalId,
+      code,
+      dry_run: dryRun,
+      force,
+      fencing_token: fencingToken,
+      idle_before: idleBefore ?? null,
+    });
   }
 
   async reconcile(problems: Array<[string, string]>): Promise<RustReconcileResult> {

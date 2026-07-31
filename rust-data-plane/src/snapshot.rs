@@ -544,6 +544,10 @@ impl SnapshotManager {
             return Err(e);
         }
 
+        // ClueOJ uploads use the same flock key. Only the short publication
+        // phase is locked; downloading R2 objects into the hidden staging
+        // directory does not block uploads.
+        let _file_lock = paths::lock_problem_data(parent, problem_id)?;
         let mut tx = self.db.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 2907))")
             .bind(problem_id)
@@ -560,10 +564,33 @@ impl SnapshotManager {
         .fetch_optional(&mut *tx)
         .await?;
         if ready.is_none() {
+            let _ = tokio::fs::remove_dir_all(&staging).await;
             return Err(AppError::SnapshotNotReady {
                 problem_id: problem_id.to_string(),
                 generation,
             });
+        }
+        let dirty: bool =
+            sqlx::query_scalar("SELECT dirty FROM problems WHERE external_id = $1 FOR UPDATE")
+                .bind(problem_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if dirty {
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+            return Err(AppError::FileChurn(problem_id.to_string()));
+        }
+        if dest.exists() {
+            let code = dest
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| AppError::PathEscape(dest.display().to_string()))?;
+            let current_scan = crate::scanner::scan_problem_folder(parent, code)?;
+            let matching =
+                crate::db::ready_snapshot_matches_scan(&self.db, problem_id, &current_scan).await?;
+            if matching != Some(generation) {
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+                return Err(AppError::FileChurn(problem_id.to_string()));
+            }
         }
         let old = parent.join(format!(
             ".{}.old.{}",
@@ -613,6 +640,7 @@ impl SnapshotManager {
         latest.ok_or_else(|| AppError::R2NotReady(problem_id.to_string()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn evict_local(
         &self,
         problem_id: &str,
@@ -621,6 +649,7 @@ impl SnapshotManager {
         dry_run: bool,
         force: bool,
         fencing_token: i64,
+        idle_before: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AppResult<EvictResult> {
         // Fencing: stale worker must not evict after a newer job mutated state.
         let latest: Option<i64> =
@@ -641,7 +670,7 @@ impl SnapshotManager {
 
         let row = sqlx::query_scalar::<_, Option<i64>>(
             r#"SELECT snapshot_generation::BIGINT FROM problem_usage
-               WHERE problem_id = $1 AND r2_status = 'ready'"#,
+               WHERE problem_id = $1 AND lower(r2_status) = 'ready'"#,
         )
         .bind(problem_id)
         .fetch_optional(&self.db)
@@ -651,28 +680,32 @@ impl SnapshotManager {
             .flatten()
             .ok_or(AppError::R2NotReady(problem_id.to_string()))?;
 
-        let mkey = manifest_key(problem_id, gen);
-        let manifest_bytes = self.store.get_object(&mkey).await?;
-        let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
-            .map_err(|e| AppError::Internal(format!("manifest parse: {e}")))?;
-        validate_manifest(&manifest, problem_id, gen)?;
-
+        let _file_lock = paths::lock_problem_data(problem_root, problem_id)?;
         let folder = paths::safe_problem_folder(problem_root, code)?;
-        let mut freed: u64 = 0;
-        let mut removed: i64 = 0;
-        let candidates: Vec<&ManifestFile> = manifest
-            .files
-            .iter()
-            .filter(|file| is_evictable_file(file, manifest.canonical_download_path.as_deref()))
-            .collect();
+        if !folder.exists() {
+            return Ok(EvictResult {
+                problem_id: problem_id.to_string(),
+                dry_run,
+                freed_bytes: 0,
+                files_removed: 0,
+                preserved_init_yml: false,
+            });
+        }
+        let scan = crate::scanner::scan_problem_folder(problem_root, code)?;
+        let matching = crate::db::ready_snapshot_matches_scan(&self.db, problem_id, &scan).await?;
+        if matching != Some(gen) {
+            return Err(AppError::EvictionDirty);
+        }
+        let freed = scan.logical_bytes;
+        let removed = scan.file_count;
         if dry_run {
-            for file in candidates {
-                let p = paths::safe_join(&folder, &file.path)?;
-                if p.exists() {
-                    freed += file.size;
-                    removed += 1;
-                }
-            }
+            return Ok(EvictResult {
+                problem_id: problem_id.to_string(),
+                dry_run: true,
+                freed_bytes: freed,
+                files_removed: removed,
+                preserved_init_yml: false,
+            });
         } else {
             let mut tx = self.db.begin().await?;
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 2907))")
@@ -680,51 +713,65 @@ impl SnapshotManager {
                 .execute(&mut *tx)
                 .await?;
             ensure_latest_fencing_tx(&mut tx, problem_id, fencing_token).await?;
-            let current: Option<i64> = sqlx::query_scalar(
-                r#"SELECT snapshot_generation::BIGINT FROM problem_usage
-                   WHERE problem_id = $1 AND r2_status = 'ready'
-                   FOR UPDATE"#,
-            )
-            .bind(problem_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .flatten();
-            if current != Some(gen) {
+            let current =
+                sqlx::query_as::<_, (Option<i64>, bool, Option<chrono::DateTime<chrono::Utc>>)>(
+                    r#"SELECT pu.snapshot_generation::BIGINT, p.dirty, pu.last_accessed_at
+                   FROM problem_usage pu
+                   JOIN problems p ON p.external_id = pu.problem_id
+                   WHERE pu.problem_id = $1 AND lower(pu.r2_status) = 'ready'
+                   FOR UPDATE OF pu, p"#,
+                )
+                .bind(problem_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let Some((current_generation, dirty, last_accessed_at)) = current else {
+                return Err(AppError::R2NotReady(problem_id.to_string()));
+            };
+            if current_generation != Some(gen) {
                 return Err(AppError::R2NotReady(problem_id.to_string()));
             }
-            for file in candidates {
-                let p = paths::safe_join(&folder, &file.path)?;
-                if !p.exists() {
-                    continue;
-                }
-                let current = crate::hasher::stable_sha256_file(&p, 1)?;
-                if current != file.sha256 {
-                    return Err(AppError::ChecksumMismatch {
-                        expected: file.sha256.clone(),
-                        got: current,
-                    });
-                }
-                let staging = p.with_file_name(format!(
-                    ".{}.evict.{}",
-                    p.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
-                    uuid::Uuid::new_v4()
-                ));
-                match std::fs::rename(&p, &staging).and_then(|_| std::fs::remove_file(&staging)) {
-                    Ok(_) => {
-                        freed += file.size;
-                        removed += 1;
-                    }
-                    Err(e) => tracing::warn!(error = %e, path = ?p, "evict remove failed"),
-                }
+            if dirty {
+                return Err(AppError::EvictionDirty);
             }
-            sqlx::query(
-                r#"UPDATE problem_usage SET local_status = 'partial', observed_at = NOW()
-                   WHERE problem_id = $1"#,
+            if idle_before.is_some_and(|cutoff| {
+                last_accessed_at.is_some_and(|last_access| last_access > cutoff)
+            }) {
+                return Err(AppError::EvictionRecentlyAccessed);
+            }
+
+            let staging = folder.with_file_name(format!(
+                ".{}.evict.{}",
+                folder
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("problem"),
+                uuid::Uuid::new_v4()
+            ));
+            tokio::fs::rename(&folder, &staging)
+                .await
+                .map_err(AppError::Io)?;
+            let updated = sqlx::query(
+                r#"UPDATE problem_usage
+                   SET local_status = 'missing', observed_at = NOW(), stale = false
+                   WHERE problem_id = $1
+                     AND snapshot_generation = $2
+                     AND lower(r2_status) = 'ready'"#,
             )
             .bind(problem_id)
+            .bind(gen)
             .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
+            .await;
+            if let Err(err) = updated {
+                let _ = tokio::fs::rename(&staging, &folder).await;
+                return Err(AppError::Database(err));
+            }
+            if let Err(err) = tx.commit().await {
+                let _ = tokio::fs::rename(&staging, &folder).await;
+                return Err(AppError::Database(err));
+            }
+            if let Err(err) = tokio::fs::remove_dir_all(&staging).await {
+                tracing::warn!(error = %err, path = ?staging, "evicted staging cleanup failed");
+            }
         }
 
         Ok(EvictResult {
@@ -732,7 +779,7 @@ impl SnapshotManager {
             dry_run,
             freed_bytes: freed,
             files_removed: removed,
-            preserved_init_yml: true,
+            preserved_init_yml: false,
         })
     }
 
@@ -1135,20 +1182,4 @@ fn validate_manifest(manifest: &Manifest, problem_id: &str, generation: i64) -> 
         }
     }
     Ok(())
-}
-
-fn is_evictable_file(file: &ManifestFile, canonical_download_path: Option<&str>) -> bool {
-    let lower = file.path.to_lowercase();
-    if lower == "init.yml"
-        || lower.ends_with("/init.yml")
-        || lower.contains("checker")
-        || lower.contains("grader")
-        || lower.ends_with(".h")
-        || lower.ends_with(".hpp")
-    {
-        return false;
-    }
-    canonical_download_path == Some(file.path.as_str())
-        || lower.ends_with(".cache")
-        || lower.contains("/cache/")
 }

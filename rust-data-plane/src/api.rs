@@ -298,6 +298,7 @@ struct EvictReq {
     dry_run: Option<bool>,
     force: Option<bool>,
     fencing_token: i64,
+    idle_before: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 async fn evict(
@@ -318,6 +319,7 @@ async fn evict(
             req.dry_run.unwrap_or(true),
             req.force.unwrap_or(false),
             req.fencing_token,
+            req.idle_before,
         )
         .await?;
     Ok(Json(result))
