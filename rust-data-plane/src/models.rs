@@ -89,6 +89,8 @@ pub struct FileEntry {
     pub mode: u32,
     #[serde(default)]
     pub duplicate_of: Option<String>,
+    #[serde(default)]
+    pub symlink_target: Option<String>,
     pub is_dir: bool,
 }
 
@@ -147,6 +149,8 @@ pub struct ManifestFile {
     pub nlink: u64,
     #[serde(default)]
     pub duplicate_of: Option<String>,
+    #[serde(default)]
+    pub symlink_target: Option<String>,
     pub object_key: String,
 }
 

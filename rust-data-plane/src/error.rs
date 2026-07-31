@@ -29,6 +29,16 @@ pub enum AppError {
     Unauthorized,
     #[error("storage object not found: {0}")]
     ObjectNotFound(String),
+    #[error(
+        "R2 snapshot manifest missing for problem {problem_id} generation {generation}: {key}"
+    )]
+    R2ManifestMissing {
+        problem_id: String,
+        generation: i64,
+        key: String,
+    },
+    #[error("R2 snapshot object missing for {path}: {key}")]
+    R2ObjectMissing { path: String, key: String },
     #[error("checksum mismatch: expected {expected} got {got}")]
     ChecksumMismatch { expected: String, got: String },
     #[error("path escape detected: {0}")]
@@ -86,6 +96,10 @@ impl AppError {
             AppError::R2NotReady(_) => (StatusCode::CONFLICT, "R2_NOT_READY", true),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", false),
             AppError::ObjectNotFound(_) => (StatusCode::NOT_FOUND, "OBJECT_NOT_FOUND", false),
+            AppError::R2ManifestMissing { .. } => {
+                (StatusCode::NOT_FOUND, "R2_MANIFEST_MISSING", true)
+            }
+            AppError::R2ObjectMissing { .. } => (StatusCode::NOT_FOUND, "R2_OBJECT_MISSING", true),
             AppError::ChecksumMismatch { .. } => (StatusCode::CONFLICT, "CHECKSUM_MISMATCH", false),
             AppError::PathEscape(_) => (StatusCode::BAD_REQUEST, "PATH_ESCAPE", false),
             AppError::FileChurn(_) => (StatusCode::CONFLICT, "FILE_CHURN", true),

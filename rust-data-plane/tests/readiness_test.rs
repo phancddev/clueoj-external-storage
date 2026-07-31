@@ -22,6 +22,7 @@ fn scan(files: &[(&str, &str, u64)]) -> ScanResult {
                 nlink: 1,
                 mode: 0o100644,
                 duplicate_of: None,
+                symlink_target: None,
                 is_dir: false,
             })
             .collect(),

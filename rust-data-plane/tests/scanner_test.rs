@@ -75,18 +75,38 @@ fn test_scan_hardlink_dedup() {
 }
 
 #[test]
-fn test_scan_symlink_not_followed() {
+fn test_scan_preserves_safe_relative_symlink_without_following() {
     let dir = tempfile::tempdir().unwrap();
     let code = "symlink_test";
     let folder = dir.path().join(code);
     fs::create_dir(&folder).unwrap();
     fs::write(folder.join("real.txt"), b"real").unwrap();
-    std::os::unix::fs::symlink(folder.join("real.txt"), folder.join("link.txt")).unwrap();
+    std::os::unix::fs::symlink("real.txt", folder.join("link.txt")).unwrap();
 
     let scan = scan_problem_folder(dir.path(), code).unwrap();
-    assert_eq!(scan.file_count, 1);
-    assert_eq!(scan.files.len(), 1);
-    assert_eq!(scan.files[0].path, "real.txt");
+    assert_eq!(scan.file_count, 2);
+    assert_eq!(scan.files.len(), 2);
+    let link = scan
+        .files
+        .iter()
+        .find(|file| file.path == "link.txt")
+        .unwrap();
+    assert_eq!(link.symlink_target.as_deref(), Some("real.txt"));
+    assert_eq!(
+        link.sha256,
+        rust_data_plane::hasher::sha256_bytes(b"real.txt")
+    );
+}
+
+#[test]
+fn test_scan_rejects_symlink_escaping_problem_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = "symlink_escape";
+    let folder = dir.path().join(code);
+    fs::create_dir(&folder).unwrap();
+    std::os::unix::fs::symlink("../outside.txt", folder.join("link.txt")).unwrap();
+
+    assert!(scan_problem_folder(dir.path(), code).is_err());
 }
 
 #[test]

@@ -199,7 +199,7 @@ impl SnapshotManager {
         .await?;
 
         let manifest = Manifest {
-            schema_version: 2,
+            schema_version: 3,
             problem_id: problem_id.to_string(),
             code: scan.code.clone(),
             generation,
@@ -507,7 +507,16 @@ impl SnapshotManager {
             .resolve_ready_generation(problem_id, generation)
             .await?;
         let mkey = manifest_key(problem_id, generation);
-        let manifest_bytes = self.store.get_object(&mkey).await?;
+        let manifest_bytes = match self.store.get_object(&mkey).await {
+            Err(AppError::ObjectNotFound(_)) => {
+                return Err(AppError::R2ManifestMissing {
+                    problem_id: problem_id.to_string(),
+                    generation,
+                    key: mkey,
+                });
+            }
+            result => result?,
+        };
         let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|e| AppError::Internal(format!("manifest parse: {e}")))?;
         validate_manifest(&manifest, problem_id, generation)?;
@@ -611,7 +620,8 @@ impl SnapshotManager {
         }
         sqlx::query(
             r#"UPDATE problem_usage
-               SET local_status = 'present', observed_at = now(), stale = false
+               SET local_status = 'present', observed_at = now(),
+                   last_accessed_at = now(), stale = false
                WHERE problem_id = $1"#,
         )
         .bind(problem_id)
@@ -839,8 +849,9 @@ impl SnapshotManager {
 
 /// Materialize a verified manifest into an empty staging directory.
 ///
-/// Regular files are downloaded once, then hardlink entries are recreated from
-/// their manifest source. Permission bits are restored after the content is
+/// Regular files are downloaded once, hardlink entries are recreated from
+/// their manifest source, and safe relative symlinks are restored without
+/// following them. Permission bits are restored after regular content is
 /// durable; ownership deliberately remains that of the storage runtime.
 pub async fn materialize_manifest_files(
     store: &dyn ObjectStore,
@@ -850,7 +861,7 @@ pub async fn materialize_manifest_files(
     for file in manifest
         .files
         .iter()
-        .filter(|file| file.duplicate_of.is_none())
+        .filter(|file| file.duplicate_of.is_none() && file.symlink_target.is_none())
     {
         paths::validate_relative_path(&file.path)?;
         let target = paths::safe_join(staging, &file.path)?;
@@ -864,7 +875,15 @@ pub async fn materialize_manifest_files(
             .and_then(|name| name.to_str())
             .unwrap_or("file");
         let tmp = target.with_file_name(format!(".{file_name}.restore.{}", uuid::Uuid::new_v4()));
-        let actual = store.get_object_to_path(&file.object_key, &tmp).await?;
+        let actual = match store.get_object_to_path(&file.object_key, &tmp).await {
+            Err(AppError::ObjectNotFound(_)) => {
+                return Err(AppError::R2ObjectMissing {
+                    path: file.path.clone(),
+                    key: file.object_key.clone(),
+                });
+            }
+            result => result?,
+        };
         if actual != file.sha256 {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(AppError::ChecksumMismatch {
@@ -881,7 +900,7 @@ pub async fn materialize_manifest_files(
     for file in manifest
         .files
         .iter()
-        .filter(|file| file.duplicate_of.is_some())
+        .filter(|file| file.duplicate_of.is_some() && file.symlink_target.is_none())
     {
         paths::validate_relative_path(&file.path)?;
         let source_path = file.duplicate_of.as_deref().ok_or_else(|| {
@@ -899,6 +918,7 @@ pub async fn materialize_manifest_files(
                 ))
             })?;
         if source_manifest.duplicate_of.is_some()
+            || source_manifest.symlink_target.is_some()
             || source_manifest.sha256 != file.sha256
             || source_manifest.size != file.size
         {
@@ -919,7 +939,55 @@ pub async fn materialize_manifest_files(
             .map_err(AppError::Io)?;
         restore_mode(&target, file.mode).await?;
     }
+
+    for file in manifest
+        .files
+        .iter()
+        .filter(|file| file.symlink_target.is_some())
+    {
+        paths::validate_relative_path(&file.path)?;
+        let link_target = file.symlink_target.as_deref().ok_or_else(|| {
+            AppError::ManifestIntegrity(format!("symlink target missing for {}", file.path))
+        })?;
+        paths::validate_symlink_target(&file.path, link_target)?;
+        let object = match store.get_object(&file.object_key).await {
+            Err(AppError::ObjectNotFound(_)) => {
+                return Err(AppError::R2ObjectMissing {
+                    path: file.path.clone(),
+                    key: file.object_key.clone(),
+                });
+            }
+            result => result?,
+        };
+        let actual = crate::hasher::sha256_bytes(&object);
+        if actual != file.sha256 || object.as_ref() != link_target.as_bytes() {
+            return Err(AppError::ChecksumMismatch {
+                expected: file.sha256.clone(),
+                got: actual,
+            });
+        }
+        let target = paths::safe_join(staging, &file.path)?;
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(AppError::Io)?;
+        }
+        create_symlink(link_target, &target)?;
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(link_target: &str, path: &Path) -> AppResult<()> {
+    std::os::unix::fs::symlink(link_target, path).map_err(AppError::Io)
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_link_target: &str, path: &Path) -> AppResult<()> {
+    Err(AppError::SpecialFile(format!(
+        "symlink restore unsupported on this platform: {}",
+        path.display()
+    )))
 }
 
 #[cfg(unix)]
@@ -986,7 +1054,18 @@ async fn upload_manifest_file(
 ) -> AppResult<ManifestFile> {
     paths::validate_relative_path(&file.path)?;
     let abs = paths::safe_join(&folder, &file.path)?;
-    let stable_sha = crate::hasher::stable_sha256_file(&abs, 2)?;
+    let symlink_bytes = file
+        .symlink_target
+        .as_ref()
+        .map(|target| target.as_bytes().to_vec());
+    if let Some(target) = file.symlink_target.as_deref() {
+        paths::validate_symlink_target(&file.path, target)?;
+    }
+    let stable_sha = if let Some(bytes) = symlink_bytes.as_deref() {
+        crate::hasher::sha256_bytes(bytes)
+    } else {
+        crate::hasher::stable_sha256_file(&abs, 2)?
+    };
     if stable_sha != file.sha256 {
         return Err(AppError::ChecksumMismatch {
             expected: file.sha256,
@@ -1003,9 +1082,13 @@ async fn upload_manifest_file(
             });
         }
     } else {
-        store
-            .put_object_from_path(&object_key, &abs, &stable_sha)
-            .await?;
+        if let Some(bytes) = symlink_bytes {
+            store.put_object(&object_key, bytes, &stable_sha).await?;
+        } else {
+            store
+                .put_object_from_path(&object_key, &abs, &stable_sha)
+                .await?;
+        }
         if !store.verify_object(&object_key, &stable_sha).await? {
             return Err(AppError::ChecksumMismatch {
                 expected: stable_sha,
@@ -1042,6 +1125,7 @@ async fn upload_manifest_file(
         ino: file.ino,
         nlink: file.nlink,
         duplicate_of: file.duplicate_of,
+        symlink_target: file.symlink_target,
         object_key,
     })
 }
@@ -1126,6 +1210,8 @@ fn error_code(err: &AppError) -> &'static str {
         AppError::FileChurn(_) => "file_churn",
         AppError::FencingMismatch { .. } => "fencing_mismatch",
         AppError::R2(_) => "r2_error",
+        AppError::R2ManifestMissing { .. } => "r2_manifest_missing",
+        AppError::R2ObjectMissing { .. } | AppError::ObjectNotFound(_) => "r2_object_missing",
         AppError::ManifestIntegrity(_) => "manifest_integrity",
         AppError::PathEscape(_) => "path_escape",
         AppError::SpecialFile(_) => "special_file",
@@ -1134,7 +1220,7 @@ fn error_code(err: &AppError) -> &'static str {
 }
 
 fn validate_manifest(manifest: &Manifest, problem_id: &str, generation: i64) -> AppResult<()> {
-    if manifest.schema_version == 0 || manifest.schema_version > 2 {
+    if manifest.schema_version == 0 || manifest.schema_version > 3 {
         return Err(AppError::ManifestIntegrity(format!(
             "unsupported schema_version {}",
             manifest.schema_version
@@ -1163,6 +1249,22 @@ fn validate_manifest(manifest: &Manifest, problem_id: &str, generation: i64) -> 
                 file.path
             )));
         }
+        if let Some(target) = file.symlink_target.as_deref() {
+            if manifest.schema_version < 3 || file.duplicate_of.is_some() {
+                return Err(AppError::ManifestIntegrity(format!(
+                    "invalid symlink metadata for {}",
+                    file.path
+                )));
+            }
+            paths::validate_symlink_target(&file.path, target)?;
+            let target_sha = crate::hasher::sha256_bytes(target.as_bytes());
+            if file.sha256 != target_sha || file.size != target.len() as u64 {
+                return Err(AppError::ManifestIntegrity(format!(
+                    "symlink metadata mismatch for {}",
+                    file.path
+                )));
+            }
+        }
         if file.duplicate_of.is_none() {
             logical += file.size;
         }
@@ -1179,6 +1281,15 @@ fn validate_manifest(manifest: &Manifest, problem_id: &str, generation: i64) -> 
             return Err(AppError::ManifestIntegrity(format!(
                 "canonical artifact missing: {canonical}"
             )));
+        }
+        if manifest
+            .files
+            .iter()
+            .any(|file| file.path == *canonical && file.symlink_target.is_some())
+        {
+            return Err(AppError::ManifestIntegrity(
+                "canonical artifact cannot be a symlink".to_string(),
+            ));
         }
     }
     Ok(())

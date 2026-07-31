@@ -1,3 +1,4 @@
+use rust_data_plane::error::AppError;
 use rust_data_plane::models::{Manifest, ManifestFile};
 use rust_data_plane::r2::InMemoryStore;
 use rust_data_plane::r2::ObjectStore;
@@ -197,6 +198,7 @@ async fn test_restore_materializes_modes_and_hardlinks() {
         ino: 2,
         nlink: 2,
         duplicate_of: None,
+        symlink_target: None,
         object_key: object_key.clone(),
     };
     let duplicate = ManifestFile {
@@ -228,6 +230,94 @@ async fn test_restore_materializes_modes_and_hardlinks() {
     assert_eq!(std::fs::read(dir.path().join("bin/runner")).unwrap(), data);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_restore_materializes_safe_relative_symlink() {
+    let store = setup().await;
+    let target = "data/input.txt";
+    let sha = rust_data_plane::hasher::sha256_bytes(target.as_bytes());
+    let object_key = rust_data_plane::models::object_key_for_sha256(&sha);
+    store
+        .put_object(&object_key, target.as_bytes().to_vec(), &sha)
+        .await
+        .unwrap();
+    let manifest = Manifest {
+        schema_version: 3,
+        problem_id: "p1".to_string(),
+        code: "sum".to_string(),
+        generation: 1,
+        created_at: chrono::Utc::now(),
+        files: vec![ManifestFile {
+            path: "input-link".to_string(),
+            sha256: sha,
+            size: target.len() as u64,
+            allocated_bytes: 0,
+            mode: 0o120777,
+            dev: 1,
+            ino: 3,
+            nlink: 1,
+            duplicate_of: None,
+            symlink_target: Some(target.to_string()),
+            object_key,
+        }],
+        canonical_download_path: None,
+        total_bytes: target.len() as u64,
+        file_count: 1,
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    materialize_manifest_files(&store, &manifest, dir.path())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_link(dir.path().join("input-link")).unwrap(),
+        std::path::PathBuf::from(target),
+    );
+}
+
+#[tokio::test]
+async fn test_restore_classifies_missing_snapshot_object() {
+    let store = setup().await;
+    let data = b"missing".to_vec();
+    let sha = rust_data_plane::hasher::sha256_bytes(&data);
+    let object_key = rust_data_plane::models::object_key_for_sha256(&sha);
+    let manifest = Manifest {
+        schema_version: 3,
+        problem_id: "p1".to_string(),
+        code: "sum".to_string(),
+        generation: 1,
+        created_at: chrono::Utc::now(),
+        files: vec![ManifestFile {
+            path: "data.txt".to_string(),
+            sha256: sha,
+            size: data.len() as u64,
+            allocated_bytes: data.len() as u64,
+            mode: 0o100644,
+            dev: 1,
+            ino: 4,
+            nlink: 1,
+            duplicate_of: None,
+            symlink_target: None,
+            object_key: object_key.clone(),
+        }],
+        canonical_download_path: None,
+        total_bytes: data.len() as u64,
+        file_count: 1,
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    let error = materialize_manifest_files(&store, &manifest, dir.path())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::R2ObjectMissing { path, key }
+            if path == "data.txt" && key == object_key
+    ));
+}
+
 #[tokio::test]
 async fn test_restore_rejects_missing_hardlink_source() {
     let store = setup().await;
@@ -250,6 +340,7 @@ async fn test_restore_rejects_missing_hardlink_source() {
             ino: 2,
             nlink: 2,
             duplicate_of: Some("missing.txt".to_string()),
+            symlink_target: None,
             object_key,
         }],
         canonical_download_path: None,

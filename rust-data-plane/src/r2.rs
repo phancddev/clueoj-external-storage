@@ -157,7 +157,16 @@ impl ObjectStore for R2Client {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::R2(e.to_string()))?;
+            .map_err(|error| {
+                if error
+                    .as_service_error()
+                    .is_some_and(|service| service.is_no_such_key())
+                {
+                    AppError::ObjectNotFound(key.to_string())
+                } else {
+                    AppError::R2(format!("get_object failed for key {key}"))
+                }
+            })?;
         let body = resp
             .body
             .collect()
@@ -174,7 +183,16 @@ impl ObjectStore for R2Client {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::R2(e.to_string()))?;
+            .map_err(|error| {
+                if error
+                    .as_service_error()
+                    .is_some_and(|service| service.is_no_such_key())
+                {
+                    AppError::ObjectNotFound(key.to_string())
+                } else {
+                    AppError::R2(format!("get_object failed for key {key}"))
+                }
+            })?;
         let mut body = resp.body;
         let mut file = tokio::fs::File::create(path).await.map_err(AppError::Io)?;
         let mut hasher = Sha256::new();

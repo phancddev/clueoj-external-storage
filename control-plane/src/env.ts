@@ -1,4 +1,5 @@
 import { Pool } from 'pg';
+import { logger } from './logger.js';
 
 export interface Env {
   databaseUrl: string;
@@ -55,10 +56,21 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
 }
 
 export function createPool(env: Env): Pool {
-  return new Pool({
+  const pool = new Pool({
     connectionString: env.databaseUrl,
     max: 20,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
   });
+  // node-postgres emits an `error` event when an idle pooled connection is
+  // terminated (for example during a PostgreSQL restart). Without a listener,
+  // EventEmitter treats it as uncaught and terminates the control plane.
+  // The pool discards that client and reconnects on the next query.
+  pool.on('error', (err) => {
+    logger.error(
+      { error_code: (err as NodeJS.ErrnoException).code, error_name: err.name },
+      'PostgreSQL idle client disconnected; connection pool will recover',
+    );
+  });
+  return pool;
 }

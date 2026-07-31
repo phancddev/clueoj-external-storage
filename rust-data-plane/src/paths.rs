@@ -65,6 +65,35 @@ pub fn validate_relative_path(path: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Validate a relative symlink without following it.
+///
+/// `target` may contain `.` or `..`, but resolving it from the link's parent
+/// must remain inside the problem folder. Absolute links and links that escape
+/// the problem root are rejected.
+pub fn validate_symlink_target(link_path: &str, target: &str) -> AppResult<()> {
+    validate_relative_path(link_path)?;
+    let target_path = Path::new(target);
+    if target.is_empty() || target_path.is_absolute() {
+        return Err(AppError::PathEscape(format!("{link_path} -> {target}")));
+    }
+
+    let mut depth = Path::new(link_path)
+        .parent()
+        .map(|parent| parent.components().count())
+        .unwrap_or(0);
+    for component in target_path.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir if depth > 0 => depth -= 1,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(AppError::PathEscape(format!("{link_path} -> {target}")));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_problem_code(code: &str) -> AppResult<()> {
     validate_relative_path(code)
 }

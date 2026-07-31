@@ -73,7 +73,45 @@ pub fn scan_problem_folder(root: &Path, code: &str) -> AppResult<ScanResult> {
 
         let file_type = entry.file_type();
         if file_type.is_symlink() {
-            tracing::warn!(path = ?entry.path(), "symlink skipped");
+            let rel_path = paths::normalized_relative_path(&folder, entry.path())?;
+            let target = std::fs::read_link(entry.path()).map_err(AppError::Io)?;
+            let target = target.to_str().ok_or_else(|| {
+                AppError::SpecialFile(format!("non-UTF-8 symlink target: {rel_path}"))
+            })?;
+            paths::validate_symlink_target(&rel_path, target)?;
+            let meta = std::fs::symlink_metadata(entry.path()).map_err(AppError::Io)?;
+            #[cfg(unix)]
+            use std::os::unix::fs::MetadataExt;
+            #[cfg(unix)]
+            let (dev, ino, nlink, blocks, mode) = (
+                meta.dev(),
+                meta.ino(),
+                meta.nlink(),
+                meta.blocks(),
+                meta.mode(),
+            );
+            #[cfg(not(unix))]
+            let (dev, ino, nlink, blocks, mode) = (0u64, 0u64, 1u64, 0u64, 0u32);
+            let size = target.len() as u64;
+            let allocated = blocks * 512;
+            let sha = crate::hasher::sha256_bytes(target.as_bytes());
+            logical_bytes += size;
+            allocated_bytes += allocated;
+            auxiliary_bytes += size;
+            file_count += 1;
+            files.push(FileEntry {
+                path: rel_path,
+                sha256: sha,
+                size,
+                allocated_bytes: allocated,
+                dev,
+                ino,
+                nlink,
+                mode,
+                duplicate_of: None,
+                symlink_target: Some(target.to_string()),
+                is_dir: false,
+            });
             continue;
         }
 
@@ -155,6 +193,7 @@ pub fn scan_problem_folder(root: &Path, code: &str) -> AppResult<ScanResult> {
             nlink,
             mode,
             duplicate_of,
+            symlink_target: None,
             is_dir: false,
         });
     }
@@ -192,7 +231,10 @@ pub fn canonical_download_path_from_folder(folder: &Path, files: &[FileEntry]) -
     let init = std::fs::read_to_string(folder.join("init.yml")).ok();
     let init_archive = init.as_deref().and_then(parse_init_archive);
     if let Some(archive) = init_archive {
-        if files.iter().any(|f| f.path == archive) {
+        if files
+            .iter()
+            .any(|f| f.path == archive && f.symlink_target.is_none())
+        {
             return Some(archive);
         }
     }

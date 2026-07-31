@@ -83,6 +83,7 @@ export const ProblemUsage = Type.Object({
   orphan_bytes: Bytes,
   referenced_bytes: Bytes,
   quota_bytes: Type.Union([Bytes, Type.Null()]),
+  last_accessed_at: Type.Optional(Type.Union([Rfc3339, Type.Null()])),
   observed_at: Rfc3339,
   stale: Type.Boolean(),
 });
@@ -245,6 +246,7 @@ export const SyncChange = Type.Object({
   snapshot_generation: Type.Union([Type.Integer(), Type.Null()]),
   orphan_bytes: Bytes,
   referenced_bytes: Bytes,
+  last_accessed_at: Type.Optional(Type.Union([Rfc3339, Type.Null()])),
   observed_at: Rfc3339,
   stale: Type.Boolean(),
   updated_at: Rfc3339,

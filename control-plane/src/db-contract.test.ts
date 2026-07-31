@@ -26,6 +26,7 @@ function syncRow(id: string, seconds: number) {
     snapshot_generation: 1,
     orphan_bytes: 0,
     referenced_bytes: 0,
+    last_accessed_at: t(seconds),
     stale: false,
     p_observed_at: t(seconds),
     pu_observed_at: t(seconds),
@@ -248,6 +249,7 @@ describe('DB contract hardening', () => {
     const result = await db.getSyncChanges(new SyncPool([syncRow('1', 1)]) as any, { limit: 100 });
     expect(result.has_more).toBe(false);
     expect(result.changes).toHaveLength(1);
+    expect(result.changes[0].last_accessed_at).toBe(t(1).toISOString());
     expect(result.next_cursor).toBeTruthy();
   });
 

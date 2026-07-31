@@ -1217,6 +1217,10 @@ components:
           type: integer
           nullable: true
           minimum: 0
+        last_accessed_at:
+          type: string
+          format: date-time
+          nullable: true
         observed_at: { type: string, format: date-time }
         stale: { type: boolean }
 
@@ -1420,6 +1424,10 @@ components:
           nullable: true
         orphan_bytes: { type: integer, minimum: 0 }
         referenced_bytes: { type: integer, minimum: 0 }
+        last_accessed_at:
+          type: string
+          format: date-time
+          nullable: true
         observed_at: { type: string, format: date-time }
         stale: { type: boolean }
         updated_at: { type: string, format: date-time }

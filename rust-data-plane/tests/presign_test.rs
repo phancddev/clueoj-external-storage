@@ -109,6 +109,7 @@ fn manifest() -> Manifest {
             ino: 0,
             nlink: 1,
             duplicate_of: None,
+            symlink_target: None,
             object_key: "objects/sha256/ab/abcd".to_string(),
         }],
     }

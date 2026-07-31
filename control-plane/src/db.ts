@@ -558,15 +558,16 @@ export async function upsertProblemUsage(pool: Pool, externalId: string, usage: 
   snapshot_generation?: number | null;
   orphan_bytes?: number | string;
   referenced_bytes?: number | string;
+  last_accessed_at?: string | null;
   observed_at?: string;
 }): Promise<ProblemUsageT> {
   const { rows } = await pool.query(
     `INSERT INTO problem_usage (
        problem_id, logical_bytes, allocated_bytes, archive_bytes, auxiliary_bytes,
        file_count, local_status, r2_status, snapshot_generation, orphan_bytes,
-       referenced_bytes, observed_at, stale
+       referenced_bytes, last_accessed_at, observed_at, stale
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12::timestamptz, now()), false)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::timestamptz, COALESCE($13::timestamptz, now()), false)
      ON CONFLICT (problem_id) DO UPDATE SET
        logical_bytes = EXCLUDED.logical_bytes,
        allocated_bytes = EXCLUDED.allocated_bytes,
@@ -578,6 +579,7 @@ export async function upsertProblemUsage(pool: Pool, externalId: string, usage: 
        snapshot_generation = EXCLUDED.snapshot_generation,
        orphan_bytes = EXCLUDED.orphan_bytes,
        referenced_bytes = EXCLUDED.referenced_bytes,
+       last_accessed_at = COALESCE(EXCLUDED.last_accessed_at, problem_usage.last_accessed_at),
        observed_at = EXCLUDED.observed_at,
        stale = false
      RETURNING *`,
@@ -593,6 +595,7 @@ export async function upsertProblemUsage(pool: Pool, externalId: string, usage: 
       usage.snapshot_generation ?? null,
       usage.orphan_bytes ?? 0,
       usage.referenced_bytes ?? 0,
+      usage.last_accessed_at ?? null,
       usage.observed_at ?? null,
     ],
   );
@@ -609,11 +612,14 @@ export async function upsertProblemUsageForJob(pool: Pool, job: JobT, externalId
 export async function markLocalPresentForJob(pool: Pool, job: JobT, externalId: string, generation: number | null): Promise<void> {
   await assertJobLease(pool, job);
   await pool.query(
-    `INSERT INTO problem_usage (problem_id, local_status, snapshot_generation, observed_at, stale)
-     VALUES ($1, 'present', $2, now(), false)
+    `INSERT INTO problem_usage (
+       problem_id, local_status, snapshot_generation, last_accessed_at, observed_at, stale
+     )
+     VALUES ($1, 'present', $2, now(), now(), false)
      ON CONFLICT (problem_id) DO UPDATE SET
        local_status = 'present',
        snapshot_generation = COALESCE($2, problem_usage.snapshot_generation),
+       last_accessed_at = now(),
        observed_at = now(),
        stale = false`,
     [externalId, generation],
@@ -673,6 +679,9 @@ function rowToProblemUsage(r: Record<string, unknown>): ProblemUsageT {
     orphan_bytes: int8(r.orphan_bytes),
     referenced_bytes: int8(r.referenced_bytes),
     quota_bytes: r.quota_bytes === null || r.quota_bytes === undefined ? null : int8(r.quota_bytes),
+    last_accessed_at: r.last_accessed_at === null || r.last_accessed_at === undefined
+      ? null
+      : toRfc3339(r.last_accessed_at),
     observed_at: toRfc3339(r.observed_at),
     stale: r.stale as boolean,
   };
@@ -1831,6 +1840,9 @@ function rowToSyncChange(r: Record<string, unknown>): SyncChangeT {
     snapshot_generation: r.snapshot_generation !== null && r.snapshot_generation !== undefined ? Number(r.snapshot_generation) : null,
     orphan_bytes: int8(r.orphan_bytes ?? 0),
     referenced_bytes: int8(r.referenced_bytes ?? 0),
+    last_accessed_at: r.last_accessed_at === null || r.last_accessed_at === undefined
+      ? null
+      : toRfc3339(r.last_accessed_at),
     observed_at: toRfc3339(r.pu_observed_at ?? r.p_observed_at),
     stale: Boolean(r.stale ?? true),
     updated_at: toRfc3339(r.updated_at ?? r.p_observed_at),

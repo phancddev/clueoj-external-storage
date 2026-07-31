@@ -166,6 +166,14 @@ async fn guarded_eviction_and_restore_round_trip() {
         std::fs::read(problem_dir.join("tests.zip")).expect("read restored tests"),
         b"snapshot bytes",
     );
+    let restored_access_is_fresh: bool = sqlx::query_scalar(
+        r#"SELECT last_accessed_at > now() - interval '1 minute'
+           FROM problem_usage WHERE problem_id = 'p-evict'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read restored access fence");
+    assert!(restored_access_is_fresh);
 
     pool.close().await;
     admin

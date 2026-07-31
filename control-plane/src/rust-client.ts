@@ -17,7 +17,19 @@ export interface RustScanResult {
   archive_bytes: number;
   auxiliary_bytes: number;
   file_count: number;
-  files: Array<{ path: string; sha256: string; size: number; allocated_bytes: number; dev: number; ino: number; nlink: number; is_dir: boolean }>;
+  files: Array<{
+    path: string;
+    sha256: string;
+    size: number;
+    allocated_bytes: number;
+    dev: number;
+    ino: number;
+    nlink: number;
+    mode: number;
+    duplicate_of?: string | null;
+    symlink_target?: string | null;
+    is_dir: boolean;
+  }>;
   observed_at: string;
 }
 
@@ -180,8 +192,28 @@ export class RustClient {
 }
 
 export class RustError extends Error {
-  constructor(public statusCode: number, public body: string) {
-    super(`Rust data plane error ${statusCode}: ${body}`);
+  public readonly code: string | null;
+  public readonly retryable: boolean;
+  public readonly requestId: string | null;
+
+  constructor(public statusCode: number, body: string) {
+    let payload: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        payload = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Non-JSON upstream bodies are intentionally not copied into logs/jobs.
+    }
+    const code = typeof payload?.code === 'string' ? payload.code : null;
+    const message = typeof payload?.message === 'string'
+      ? payload.message
+      : 'data plane request failed';
+    super(`Rust data plane error ${statusCode}${code ? ` ${code}` : ''}: ${message}`);
     this.name = 'RustError';
+    this.code = code;
+    this.retryable = payload?.retryable === true;
+    this.requestId = typeof payload?.request_id === 'string' ? payload.request_id : null;
   }
 }

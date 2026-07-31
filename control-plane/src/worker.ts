@@ -269,6 +269,7 @@ export class JobWorker {
 }
 
 function errorCode(err: unknown): string {
+  if (err instanceof RustError && err.code) return err.code.toLowerCase();
   if (err instanceof Error && err.message.includes('Unsupported')) return 'unsupported_job';
   return 'job_failed';
 }
@@ -276,7 +277,7 @@ function errorCode(err: unknown): string {
 function isLiveReferenceError(err: unknown): boolean {
   return err instanceof RustError
     && err.statusCode === 409
-    && err.body.includes('"code":"OBJECT_LIVE_REFERENCE"');
+    && err.code === 'OBJECT_LIVE_REFERENCE';
 }
 
 function errorMessage(err: unknown): string {

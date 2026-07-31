@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
-import { RustClient } from './rust-client.js';
+import { RustClient, RustError } from './rust-client.js';
 import type { Env } from './env.js';
 
 let server: ReturnType<typeof createServer> | null = null;
@@ -33,6 +33,23 @@ function envFor(baseUrl: string): Env {
 }
 
 describe('RustClient contract', () => {
+  it('classifies structured data-plane errors without logging raw non-JSON bodies', () => {
+    const missing = new RustError(404, JSON.stringify({
+      code: 'R2_MANIFEST_MISSING',
+      message: 'R2 snapshot manifest missing for problem p1 generation 7',
+      retryable: true,
+      request_id: 'req-1',
+    }));
+    expect(missing.code).toBe('R2_MANIFEST_MISSING');
+    expect(missing.retryable).toBe(true);
+    expect(missing.message).toContain('R2_MANIFEST_MISSING');
+
+    const unsafeBody = 'service error at https://account.example/?secret=credential';
+    const opaque = new RustError(500, unsafeBody);
+    expect(opaque.message).not.toContain('credential');
+    expect(opaque.message).toContain('data plane request failed');
+  });
+
   it('uses Rust readiness so object-store failures degrade public health', async () => {
     let requestedPath = '';
     server = createServer((req, res) => {

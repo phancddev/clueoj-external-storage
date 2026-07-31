@@ -59,6 +59,7 @@ export interface ProblemUsage {
   referenced_bytes: ByteValue;
   quota_bytes: ByteValue | null;
   problem_count_quota: number | null;
+  last_accessed_at?: string | null;
   observed_at: string;
   stale: boolean;
 }
@@ -167,6 +168,7 @@ export interface SyncChange {
   snapshot_generation: number | null;
   orphan_bytes: ByteValue;
   referenced_bytes: ByteValue;
+  last_accessed_at?: string | null;
   observed_at: string;
   stale: boolean;
   updated_at: string;
