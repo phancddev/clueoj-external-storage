@@ -325,6 +325,21 @@ describe('DB contract hardening', () => {
     expect(pool.sql.match(/catalog_state IN \('present', 'mirror'\)/g)?.length).toBeGreaterThanOrEqual(4);
   });
 
+  it('lists each problem with its logical size in the same query', async () => {
+    let sql = '';
+    const pool = {
+      query: async (query: string) => {
+        sql = query;
+        return { rows: [problemRow({ logical_bytes: '1536' })], rowCount: 1 };
+      },
+    };
+
+    const result = await db.listProblems(pool as any, { limit: 50, sort: 'code', order: 'asc' });
+
+    expect(sql).toContain('LEFT JOIN problem_usage');
+    expect(result.items[0].logical_bytes).toBe(1536);
+  });
+
   it('initial catalog dirty/no-READY problem schedules scan then snapshot jobs', async () => {
     const jobs = await db.scheduleAutoSnapshotJobs(new AutoSchedulePool() as any, {
       external_id: 'p1',

@@ -459,7 +459,8 @@ export async function listProblems(
     sort?: string; order?: 'asc' | 'desc'; cursor?: string; limit: number;
   },
 ): Promise<Page<ProblemT>> {
-  const sortCol = mapSortColumn(opts.sort || 'external_id', ['external_id', 'code', 'owner_organization', 'observed_at']);
+  const sortField = mapSortColumn(opts.sort || 'external_id', ['external_id', 'code', 'owner_organization', 'observed_at']);
+  const sortCol = `p.${sortField}`;
   const order = opts.order === 'desc' ? 'DESC' : 'ASC';
   const limit = Math.min(opts.limit, 200);
   const params: unknown[] = [];
@@ -467,17 +468,17 @@ export async function listProblems(
   let paramIdx = 1;
 
   if (opts.search) {
-    where += ` AND (code ILIKE $${paramIdx} OR external_id::text ILIKE $${paramIdx})`;
+    where += ` AND (p.code ILIKE $${paramIdx} OR p.external_id::text ILIKE $${paramIdx})`;
     params.push(`%${opts.search}%`);
     paramIdx++;
   }
   if (opts.ownerOrg) {
-    where += ` AND owner_organization = $${paramIdx}`;
+    where += ` AND p.owner_organization = $${paramIdx}`;
     params.push(opts.ownerOrg);
     paramIdx++;
   }
   if (opts.catalogState) {
-    where += ` AND catalog_state = $${paramIdx}`;
+    where += ` AND p.catalog_state = $${paramIdx}`;
     params.push(opts.catalogState);
     paramIdx++;
   }
@@ -486,12 +487,16 @@ export async function listProblems(
   if (opts.cursor) {
     const c = decodeCursor<{ value: string; id: string }>(opts.cursor, { value: '', id: '' });
     const cmp = order === 'ASC' ? '>' : '<';
-    cursorCond = ` AND (${sortCol}, external_id) ${cmp} ($${paramIdx}, $${paramIdx + 1})`;
+    cursorCond = ` AND (${sortCol}, p.external_id) ${cmp} ($${paramIdx}, $${paramIdx + 1})`;
     params.push(c.value, c.id);
     paramIdx += 2;
   }
 
-  const sql = `SELECT * FROM problems ${where} ${cursorCond} ORDER BY ${sortCol} ${order}, external_id ${order} LIMIT $${paramIdx}`;
+  const sql = `SELECT p.*, pu.logical_bytes
+    FROM problems p
+    LEFT JOIN problem_usage pu ON pu.problem_id = p.external_id
+    ${where} ${cursorCond}
+    ORDER BY ${sortCol} ${order}, p.external_id ${order} LIMIT $${paramIdx}`;
   params.push(limit + 1);
   const { rows } = await pool.query(sql, params);
 
@@ -500,7 +505,7 @@ export async function listProblems(
   let next_cursor: string | null = null;
   if (has_more && items.length > 0) {
     const last = rows[limit - 1];
-    next_cursor = encodeCursor({ value: String(last[sortCol] ?? ''), id: String(last.external_id) });
+    next_cursor = encodeCursor({ value: String(last[sortField] ?? ''), id: String(last.external_id) });
   }
   return { items, next_cursor, has_more };
 }
@@ -513,6 +518,7 @@ function rowToProblem(r: Record<string, unknown>): ProblemT {
   return {
     external_id: String(r.external_id),
     code: String(r.code),
+    ...(r.logical_bytes === null || r.logical_bytes === undefined ? {} : { logical_bytes: int8(r.logical_bytes) }),
     owner_organization: r.owner_organization as string | null,
     is_manually_managed: r.is_manually_managed as boolean,
     mirror_of: r.mirror_of as string | null,

@@ -11,6 +11,7 @@ vi.mock('@/hooks/queries', () => ({
       items: [{
         external_id: '42',
         code: 'sum',
+        logical_bytes: 1536,
         owner_organization: 'org-a',
         is_manually_managed: false,
         mirror_of: null,
@@ -65,6 +66,7 @@ describe('dashboard page semantics', () => {
     render(<ProblemsPage />);
 
     expect(screen.getByRole('link', { name: 'sum' })).toHaveAttribute('href', '#/problems/42');
+    expect(screen.getByText('1.5 KB')).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: 'Code' })).toHaveAttribute('aria-sort', 'ascending');
     fireEvent.click(screen.getByRole('button', { name: /sort descending/i }));
     expect(screen.getByRole('button', { name: /sort ascending/i })).toBeInTheDocument();

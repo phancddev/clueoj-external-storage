@@ -9,7 +9,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Skeleton } from '@/components/ui/skeleton';
 import { ErrorState, EmptyState } from '@/components/states';
 import { StatusBadge } from '@/components/status-badge';
-import { formatRelative } from '@/lib/utils';
+import { formatBytes, formatRelative } from '@/lib/utils';
 import { ArrowUpDown, ChevronLeft, ChevronRight, Search } from 'lucide-react';
 import type { Problem } from '@/lib/types';
 
@@ -126,6 +126,7 @@ export function ProblemsPage() {
                 <TableRow>
                   <TableHead aria-sort={sort === 'code' ? (order === 'asc' ? 'ascending' : 'descending') : 'none'}>Code</TableHead>
                   <TableHead aria-sort={sort === 'external_id' ? (order === 'asc' ? 'ascending' : 'descending') : 'none'}>External ID</TableHead>
+                  <TableHead>Size</TableHead>
                   <TableHead>Owner</TableHead>
                   <TableHead>Catalog</TableHead>
                   <TableHead>Dirty</TableHead>
@@ -145,6 +146,7 @@ export function ProblemsPage() {
                       </a>
                     </TableCell>
                     <TableCell className="font-mono text-xs text-muted-foreground">{p.external_id}</TableCell>
+                    <TableCell className="tabular-nums">{formatBytes(p.logical_bytes)}</TableCell>
                     <TableCell>{p.owner_organization ?? '—'}</TableCell>
                     <TableCell><StatusBadge status={p.catalog_state} stale={p.stale} observedAt={p.observed_at} /></TableCell>
                     <TableCell>{p.dirty ? <StatusBadge status="dirty" label="Dirty" /> : 'No'}</TableCell>

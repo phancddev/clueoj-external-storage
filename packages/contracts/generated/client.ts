@@ -32,6 +32,7 @@ export interface Volume {
 export interface Problem {
   external_id: string;
   code: string;
+  logical_bytes?: ByteValue;
   owner_organization: string | null;
   is_manually_managed: boolean;
   mirror_of: string | null;

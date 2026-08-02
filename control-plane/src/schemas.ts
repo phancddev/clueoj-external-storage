@@ -46,6 +46,7 @@ export type VolumeT = Static<typeof Volume>;
 export const Problem = Type.Object({
   external_id: Type.String(),
   code: Type.String(),
+  logical_bytes: Type.Optional(Bytes),
   owner_organization: Type.Union([Type.String(), Type.Null()]),
   is_manually_managed: Type.Boolean(),
   mirror_of: Type.Union([Type.String(), Type.Null()]),
