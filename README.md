@@ -53,6 +53,8 @@ Copy `.env.example` to `.env` and fill in:
 - `STORAGE_PROBLEM_ROOT_HOST` — host path to problems dir (default `./problems`)
 - `STORAGE_PROBLEM_ROOT_CONTAINER` — container path (default `/problems`)
 - `STORAGE_PORT` — dashboard/API port (default `2907`)
+- `STORAGE_PUBLISH_HOST` — host address used to publish port 2907; defaults to
+  `127.0.0.1` and should never be `0.0.0.0` without a trusted TLS proxy
 - `STORAGE_DATABASE_URL` — PostgreSQL connection string
 - `STORAGE_PUBLIC_BASE_URL` — public URL for dashboard
 - `STORAGE_EVICTION_ENABLED` and `STORAGE_LOCAL_EVICTION_ENABLED` — both must

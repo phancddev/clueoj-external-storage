@@ -78,7 +78,9 @@ curl --fail http://127.0.0.1:2907/api/v1/system/health
 ./scripts/storage-admin create admin
 ```
 
-The dashboard is available on port `2907`.
+The dashboard is available on port `2907`. The compose file binds it to
+`127.0.0.1` by default. Use an SSH tunnel or a trusted HTTPS reverse proxy for
+operator access; do not expose the HTTP login endpoint directly to the Internet.
 
 ### Passive local-test eviction
 
@@ -103,7 +105,7 @@ single READY R2 generation.
 
 ## 3. Give ClueOJ network access
 
-The storage API publishes host port `2907`. On Docker Desktop, ClueOJ
+The storage API publishes host port `2907` on `STORAGE_PUBLISH_HOST`. On Docker Desktop, ClueOJ
 containers can use:
 
 ```dotenv
@@ -112,6 +114,11 @@ STORAGE_SERVICE_BASE_URL=http://host.docker.internal:2907/api/v1
 
 On Linux, add a client-only override to the ClueOJ deployment. This override
 does not build or start the storage app:
+
+Set `STORAGE_PUBLISH_HOST` in the storage app to the address returned for
+`host.docker.internal` inside the ClueOJ container (commonly `172.17.0.1`).
+This keeps the API reachable by ClueOJ without listening on the VPS public
+interface.
 
 ```yaml
 # clueoj/docker-compose.storage-client.yml
