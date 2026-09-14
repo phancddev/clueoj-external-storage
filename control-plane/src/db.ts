@@ -1,6 +1,7 @@
 import type { Pool, PoolClient } from 'pg';
 import type {
   ProblemT, ProblemUsageT, OrganizationUsageT, SnapshotT, JobT, AuditEventT, OrphanT, SyncChangeT,
+  ProblemFilesResponseT,
 } from './schemas.js';
 
 type Page<T> = { items: T[]; next_cursor: string | null; has_more: boolean };
@@ -551,6 +552,55 @@ export async function getLatestReadySnapshot(pool: Pool, externalId: string): Pr
     [externalId],
   );
   return rows[0] ? rowToSnapshot(rows[0]) : null;
+}
+
+export async function listProblemFiles(
+  pool: Pool, externalId: string, opts: { cursor?: string; limit: number },
+): Promise<ProblemFilesResponseT> {
+  const limit = Math.min(opts.limit, 500);
+  const snap = await getLatestReadySnapshot(pool, externalId);
+  if (!snap) {
+    return {
+      problem_id: externalId, generation: null, snapshot_id: null, snapshot_state: null,
+      snapshot_completed_at: null, total_bytes: null, file_count: null,
+      items: [], next_cursor: null, has_more: false,
+    };
+  }
+  const params: unknown[] = [snap.id];
+  let cursorCond = '';
+  if (opts.cursor) {
+    const c = decodeCursor<{ rel_path: string }>(opts.cursor, { rel_path: '' });
+    params.push(c.rel_path);
+    cursorCond = ` AND rel_path > $${params.length}`;
+  }
+  params.push(limit + 1);
+  const { rows } = await pool.query(
+    `SELECT * FROM snapshot_objects WHERE snapshot_id = $1${cursorCond} ORDER BY rel_path ASC LIMIT $${params.length}`,
+    params,
+  );
+  const has_more = rows.length > limit;
+  const items = rows.slice(0, limit).map((r: Record<string, unknown>) => ({
+    snapshot_id: String(r.snapshot_id),
+    rel_path: String(r.rel_path),
+    sha256: String(r.sha256),
+    size_bytes: int8(r.size_bytes),
+    object_key: String(r.object_key),
+    uploaded: Boolean(r.uploaded),
+    verified: Boolean(r.verified),
+  }));
+  const next_cursor = has_more && items.length > 0
+    ? encodeCursor({ rel_path: rows[limit - 1].rel_path })
+    : null;
+  return {
+    problem_id: externalId,
+    generation: snap.generation,
+    snapshot_id: snap.id,
+    snapshot_state: snap.state,
+    snapshot_completed_at: snap.completed_at,
+    total_bytes: snap.total_bytes,
+    file_count: snap.file_count,
+    items, next_cursor, has_more,
+  };
 }
 
 export async function upsertProblemUsage(pool: Pool, externalId: string, usage: {
@@ -1689,6 +1739,7 @@ export async function insertAuditEvent(pool: Pool, opts: {
 export async function listAuditEvents(
   pool: Pool, opts: {
     actor?: string; action?: string; problemId?: string;
+    from?: string; to?: string;
     cursor?: string; limit: number;
   },
 ): Promise<Page<AuditEventT>> {
@@ -1696,6 +1747,16 @@ export async function listAuditEvents(
   const params: unknown[] = [];
   let where = 'WHERE 1=1';
   let paramIdx = 1;
+  if (opts.from) {
+    where += ` AND created_at >= $${paramIdx}::timestamptz`;
+    params.push(opts.from);
+    paramIdx++;
+  }
+  if (opts.to) {
+    where += ` AND created_at <= $${paramIdx}::timestamptz`;
+    params.push(opts.to);
+    paramIdx++;
+  }
   if (opts.actor) {
     where += ` AND actor = $${paramIdx}`;
     params.push(opts.actor);

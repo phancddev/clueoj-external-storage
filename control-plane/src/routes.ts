@@ -12,7 +12,7 @@ import {
 } from './dashboard-users.js';
 import {
   LoginRequest, LoginResponse, ReconcileRequest, SyncChangesResponse, Paginated,
-  Problem, ProblemUsage, OrganizationUsage, Snapshot, Job, Orphan, AuditEvent,
+  Problem, ProblemUsage, ProblemFilesResponse, OrganizationUsage, Snapshot, Job, Orphan, AuditEvent,
   DownloadRequest, DownloadResponse, HealthResponse, Volume, AcceptedJobResponse,
   DirtyProblemRequest, EnsureReadyResponse,
   ServiceTokenRequest, ServiceTokenResponse,
@@ -419,6 +419,18 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
     const usage = await db.getProblemUsage(ctx.pool, externalId);
     if (!usage) return reply.code(404).send({ code: 'not_found', message: 'Usage not found', retryable: false, request_id: getRequestId(req) });
     reply.send(usage);
+  });
+
+  app.get('/api/v1/problems/:externalId/files', { schema: { response: { 200: ProblemFilesResponse, default: ErrorResponse } } }, async (req, reply) => {
+    if (!requireScopes(req, reply, 'read')) return;
+    const { externalId } = req.params as { externalId: string };
+    const problem = await db.getProblem(ctx.pool, externalId);
+    if (!problem) return reply.code(404).send({ code: 'not_found', message: 'Problem not found', retryable: false, request_id: getRequestId(req) });
+    const q = req.query as Record<string, string | undefined>;
+    const result = await db.listProblemFiles(ctx.pool, externalId, {
+      cursor: q.cursor, limit: parseLimit(q.limit, 200, 500),
+    });
+    reply.send(result);
   });
 
   // Mutation actions on problems
@@ -855,8 +867,25 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
   app.get('/api/v1/audit-events', { schema: { response: { 200: Paginated(AuditEvent), default: ErrorResponse } } }, async (req, reply) => {
     if (!requireScopes(req, reply, 'read', 'audit')) return;
     const q = req.query as Record<string, string | undefined>;
+    let from: string | undefined;
+    let to: string | undefined;
+    if (q.from !== undefined) {
+      const d = new Date(q.from);
+      if (Number.isNaN(d.getTime())) {
+        return reply.code(400).send({ code: 'invalid_query', message: 'from must be a valid RFC3339 timestamp', retryable: false, request_id: getRequestId(req) });
+      }
+      from = d.toISOString();
+    }
+    if (q.to !== undefined) {
+      const d = new Date(q.to);
+      if (Number.isNaN(d.getTime())) {
+        return reply.code(400).send({ code: 'invalid_query', message: 'to must be a valid RFC3339 timestamp', retryable: false, request_id: getRequestId(req) });
+      }
+      to = d.toISOString();
+    }
     const result = await db.listAuditEvents(ctx.pool, {
       actor: q.actor, action: q.action, problemId: q.problem_id,
+      from, to,
       cursor: q.cursor, limit: parseLimit(q.limit, 50, 200),
     });
     reply.send(result);

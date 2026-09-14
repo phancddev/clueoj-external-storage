@@ -4,7 +4,8 @@ import { buildRoutes } from './routes.js';
 import { signOperatorToken, signServiceToken } from './auth.js';
 import { DUMMY_PASSWORD_HASH, hashPassword } from './password.js';
 import { stableFingerprint } from './db.js';
-import type { Env } from './env.js';
+import type { Pool } from 'pg';
+import type { RustClient } from './rust-client.js';
 
 const env: Env = {
   databaseUrl: 'postgres://test',
@@ -473,7 +474,7 @@ describe('runtime route contracts', () => {
   it('ensure-ready returns ready only when local is already present', async () => {
     const app = Fastify({ logger: false });
     const pool = new EnsureReadyPool('ready');
-    await buildRoutes(app, { pool: pool as any, env, rust: rustByMode('ready') as any });
+    await buildRoutes(app, { pool: pool as unknown as Pool, env, rust: rustByMode('ready') as unknown as RustClient });
     const token = await signOperatorToken(env.dashboardJwtSecret, 'admin', 'operator', 60, env.dashboardJwtAudience);
     const res = await app.inject({
       method: 'POST',
@@ -765,3 +766,143 @@ describe('runtime route contracts', () => {
     expect(pool.jobs).toEqual([]);
   });
 });
+
+describe('problem files + audit filter contracts', () => {
+
+  it('problem files returns per-file test data of the latest READY snapshot', async () => {
+    const app = Fastify({ logger: false });
+    const pool = new FilesAuditPool();
+    await buildRoutes(app, { pool: pool as unknown as Pool, env, rust: rustByMode('ready') as unknown as RustClient });
+    const token = await signServiceToken(env.clueojServiceSecret, 'clueoj', env.clueojServiceAudience, ['read'], 60);
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/problems/p1/files',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body).toMatchObject({ problem_id: 'p1', generation: 3, snapshot_id: 'snap-1', snapshot_state: 'ready', total_bytes: 2048, file_count: 2, has_more: false });
+    expect(body.items).toHaveLength(2);
+    expect(body.items.map((i: { rel_path: string }) => i.rel_path)).toEqual(['tests/01.in', 'tests/01.out']);
+    expect(body.items[0]).toMatchObject({ sha256: 'a'.repeat(64), size_bytes: 1024, object_key: 'objects/sha256/aa/aaaa', uploaded: true, verified: true });
+  });
+
+  it('problem files returns an empty manifest when no READY snapshot exists', async () => {
+    const app = Fastify({ logger: false });
+    const pool = new FilesAuditPool();
+    pool.snapshotReady = false;
+    await buildRoutes(app, { pool: pool as unknown as Pool, env, rust: rustByMode('ready') as unknown as RustClient });
+    const token = await signServiceToken(env.clueojServiceSecret, 'clueoj', env.clueojServiceAudience, ['read'], 60);
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/problems/p1/files',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ problem_id: 'p1', generation: null, items: [], has_more: false });
+  });
+
+  it('problem files returns 404 for an unknown problem', async () => {
+    const app = Fastify({ logger: false });
+    const pool = new FilesAuditPool();
+    pool.problemExists = false;
+    await buildRoutes(app, { pool: pool as unknown as Pool, env, rust: rustByMode('ready') as unknown as RustClient });
+    const token = await signServiceToken(env.clueojServiceSecret, 'clueoj', env.clueojServiceAudience, ['read'], 60);
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/problems/p1/files',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ code: 'not_found' });
+  });
+
+  it('audit events accepts from/to range filters and validates timestamps', async () => {
+    const app = Fastify({ logger: false });
+    const pool = new FilesAuditPool();
+    await buildRoutes(app, { pool: pool as unknown as Pool, env, rust: rustByMode('ready') as unknown as RustClient });
+    const token = await signServiceToken(env.clueojServiceSecret, 'clueoj', env.clueojServiceAudience, ['read'], 60);
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/audit-events?from=2026-01-01T00:00:00Z&to=2026-01-31T23:59:59Z',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const auditQuery = pool.queries.find((q) => q.sql.includes('FROM audit_events'));
+    expect(auditQuery).toBeDefined();
+    expect(auditQuery!.sql).toContain('created_at >=');
+    expect(auditQuery!.sql).toContain('created_at <=');
+    expect(auditQuery!.params).toContain('2026-01-01T00:00:00.000Z');
+    expect(auditQuery!.params).toContain('2026-01-31T23:59:59.000Z');
+
+    const bad = await app.inject({
+      method: 'GET',
+      url: '/api/v1/audit-events?from=not-a-date',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json()).toMatchObject({ code: 'invalid_query' });
+  });
+});
+
+class FilesAuditPool {
+  queries: { sql: string; params: unknown[] }[] = [];
+  snapshotReady = true;
+  problemExists = true;
+
+  async query(sql: string, params: unknown[] = []) {
+    this.queries.push({ sql, params });
+    const dashboardUser = dashboardUserResult(sql, params);
+    if (dashboardUser) return dashboardUser;
+    if (sql.includes('FROM problems') && sql.includes('external_id')) {
+      if (!this.problemExists) return { rows: [], rowCount: 0 };
+      return {
+        rows: [{
+          external_id: String(params[0]),
+          code: 'sum',
+          owner_organization: null,
+          is_manually_managed: false,
+          mirror_of: null,
+          mirror_root: null,
+          quota_bytes: null,
+          catalog_state: 'present',
+          dirty: false,
+          dirty_generation: null,
+          dirty_version: 0,
+          observed_at: new Date(),
+          stale: false,
+        }],
+        rowCount: 1,
+      };
+    }
+    if (sql.includes('FROM snapshots')) {
+      if (!this.snapshotReady) return { rows: [], rowCount: 0 };
+      return {
+        rows: [{
+          id: 'snap-1',
+          problem_id: String(params[0]),
+          generation: 3,
+          state: 'ready',
+          file_count: 2,
+          total_bytes: 2048,
+          manifest_key: 'm',
+          error_code: null,
+          error_message: null,
+          created_at: new Date(),
+          completed_at: new Date(),
+        }],
+        rowCount: 1,
+      };
+    }
+    if (sql.includes('FROM snapshot_objects')) {
+      return {
+        rows: [
+          { snapshot_id: 'snap-1', rel_path: 'tests/01.in', sha256: 'a'.repeat(64), size_bytes: 1024, object_key: 'objects/sha256/aa/aaaa', uploaded: true, verified: true },
+          { snapshot_id: 'snap-1', rel_path: 'tests/01.out', sha256: 'b'.repeat(64), size_bytes: 1024, object_key: 'objects/sha256/bb/bbbb', uploaded: true, verified: true },
+        ],
+        rowCount: 2,
+      };
+    }
+    return { rows: [], rowCount: 0 };
+  }
+}

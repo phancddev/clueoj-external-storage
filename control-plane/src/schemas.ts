@@ -137,6 +137,39 @@ export const Snapshot = Type.Object({
 export type SnapshotT = Static<typeof Snapshot>;
 
 // ===========================================================================
+// Snapshot object (per-file test data of a snapshot)
+// ===========================================================================
+
+export const SnapshotObject = Type.Object({
+  snapshot_id: Type.String(),
+  rel_path: Type.String({ description: 'Path relative to the problem folder' }),
+  sha256: Type.String({ description: 'Content SHA-256 hex digest' }),
+  size_bytes: Bytes,
+  object_key: Type.String({ description: 'Content-addressed R2 object key' }),
+  uploaded: Type.Boolean(),
+  verified: Type.Boolean(),
+});
+export type SnapshotObjectT = Static<typeof SnapshotObject>;
+
+// ===========================================================================
+// Problem files (per-file test data of the latest READY snapshot)
+// ===========================================================================
+
+export const ProblemFilesResponse = Type.Object({
+  problem_id: Type.String(),
+  generation: Type.Union([Type.Integer(), Type.Null()]),
+  snapshot_id: Type.Union([Type.String(), Type.Null()]),
+  snapshot_state: Type.Union([Type.String(), Type.Null()]),
+  snapshot_completed_at: Type.Union([Rfc3339, Type.Null()]),
+  total_bytes: Type.Union([Bytes, Type.Null()]),
+  file_count: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  items: Type.Array(SnapshotObject),
+  next_cursor: Type.Union([Cursor, Type.Null()]),
+  has_more: Type.Boolean(),
+});
+export type ProblemFilesResponseT = Static<typeof ProblemFilesResponse>;
+
+// ===========================================================================
 // Job
 // ===========================================================================
 

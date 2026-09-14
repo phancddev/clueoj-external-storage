@@ -23,6 +23,7 @@ describe('OpenAPI contract spec', () => {
       '/problems',
       '/problems/{externalId}',
       '/problems/{externalId}/usage',
+      '/problems/{externalId}/files',
       '/problems/{externalId}/dirty',
       '/problems/{externalId}/ensure-ready',
       '/problems/{externalId}/scan',
