@@ -53,13 +53,12 @@ export interface ProblemUsage {
   archive_bytes: ByteValue;
   auxiliary_bytes: ByteValue;
   file_count: number;
-  local_status: 'present' | 'missing' | 'partial';
+  local_status: 'present' | 'missing' | 'partial' | 'orphan';
   r2_status: 'none' | 'uploading' | 'ready' | 'error' | 'superseded';
   snapshot_generation: number | null;
   orphan_bytes: ByteValue;
   referenced_bytes: ByteValue;
   quota_bytes: ByteValue | null;
-  problem_count_quota: number | null;
   last_accessed_at?: string | null;
   observed_at: string;
   stale: boolean;
@@ -74,6 +73,7 @@ export interface OrganizationUsage {
   auxiliary_bytes: ByteValue;
   referenced_bytes: ByteValue;
   quota_bytes: ByteValue | null;
+  problem_count_quota: number | null;
   observed_at: string;
   stale: boolean;
 }
@@ -92,6 +92,29 @@ export interface Snapshot {
   completed_at: string | null;
 }
 
+
+export interface SnapshotObject {
+  snapshot_id: string;
+  rel_path: string;
+  sha256: string;
+  size_bytes: ByteValue;
+  object_key: string;
+  uploaded: boolean;
+  verified: boolean;
+}
+
+export interface ProblemFilesResponse {
+  problem_id: string;
+  generation: number | null;
+  snapshot_id: string | null;
+  snapshot_state: string | null;
+  snapshot_completed_at: string | null;
+  total_bytes: ByteValue | null;
+  file_count: number | null;
+  items: SnapshotObject[];
+  next_cursor: string | null;
+  has_more: boolean;
+}
 export interface Job {
   id: string;
   idempotency_key: string;
@@ -365,13 +388,16 @@ export class StorageClient {
   }): Promise<Paginated<Problem>> {
     return this.request('GET', '/api/v1/problems', { query: params });
   }
-
   getProblem(externalId: string): Promise<Problem> {
     return this.request('GET', `/api/v1/problems/${encodeURIComponent(externalId)}`);
   }
 
   getProblemUsage(externalId: string): Promise<ProblemUsage> {
     return this.request('GET', `/api/v1/problems/${encodeURIComponent(externalId)}/usage`);
+  }
+
+  getProblemFiles(externalId: string, params?: { cursor?: string; limit?: number }): Promise<ProblemFilesResponse> {
+    return this.request('GET', `/api/v1/problems/${encodeURIComponent(externalId)}/files`, { query: params });
   }
 
   markProblemDirty(externalId: string, idempotencyKey: string, body: DirtyProblemRequest): Promise<Problem> {
@@ -467,7 +493,7 @@ export class StorageClient {
     return this.request('GET', '/api/v1/orphans', { query: { cursor, limit } });
   }
 
-  listAuditEvents(params?: { actor?: string; action?: string; problem_id?: string; cursor?: string; limit?: number }): Promise<Paginated<AuditEvent>> {
+  listAuditEvents(params?: { actor?: string; action?: string; problem_id?: string; from?: string; to?: string; cursor?: string; limit?: number }): Promise<Paginated<AuditEvent>> {
     return this.request('GET', '/api/v1/audit-events', { query: params });
   }
 
