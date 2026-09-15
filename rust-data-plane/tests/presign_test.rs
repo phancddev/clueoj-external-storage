@@ -172,6 +172,7 @@ async fn presign_prefers_problem_code_filename() {
         size: 4,
         etag: None,
         sha256: Some(manifest().files[0].sha256.clone()),
+        exists: true,
     });
     let result = presign_canonical_from_manifest(&store, &manifest(), None, Some("004d.zip"))
         .await
