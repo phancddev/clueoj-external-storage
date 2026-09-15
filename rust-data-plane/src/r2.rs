@@ -37,6 +37,7 @@ pub fn content_type_for_filename(filename: &str) -> &'static str {
     }
 }
 
+#[async_trait]
 pub trait ObjectStore: Send + Sync {
     async fn put_object(&self, key: &str, body: Vec<u8>, sha256: &str) -> AppResult<()>;
     async fn put_object_from_path(&self, key: &str, path: &Path, sha256: &str) -> AppResult<()>;
