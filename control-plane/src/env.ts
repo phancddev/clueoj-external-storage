@@ -12,6 +12,7 @@ export interface Env {
   corsAllowedOrigins: string[];
   trustProxy: boolean;
   workerEnabled: boolean;
+  workerConcurrency: number;
   workerLeaseSeconds: number;
   presignTtlSeconds: number;
   port: number;
@@ -41,6 +42,7 @@ export function loadEnv(): Env {
       .filter(Boolean),
     trustProxy: process.env.STORAGE_TRUST_PROXY === 'true',
     workerEnabled: process.env.STORAGE_WORKER_ENABLED !== 'false',
+    workerConcurrency: Math.max(1, parsePositiveInt(process.env.STORAGE_WORKER_CONCURRENCY, 1)),
     workerLeaseSeconds: parsePositiveInt(process.env.STORAGE_WORKER_LEASE_SECONDS, 60),
     presignTtlSeconds: parsePositiveInt(process.env.R2_PRESIGN_TTL_SECONDS, 180),
     port: parsePositiveInt(process.env.STORAGE_PORT, 2907),

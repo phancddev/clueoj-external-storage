@@ -20,7 +20,11 @@ export class JobWorker {
 
   start(): void {
     if (this.running) return;
-    this.running = this.loop();
+    // N parallel loops share the DB lease queue; acquireJob + fencing tokens
+    // already guarantee two workers never claim the same job.
+    this.running = Promise.all(
+      Array.from({ length: this.ctx.env.workerConcurrency }, () => this.loop()),
+    ).then(() => undefined);
   }
 
   async stop(): Promise<void> {
