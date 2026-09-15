@@ -326,21 +326,36 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
       return reply.code(400).send({ code: 'bad_request', message: 'problems array required', retryable: false, request_id: getRequestId(req) });
     }
     try {
-      for (const p of body.problems) {
-        const catalog = catalogProblemFrom(p);
+      const catalogProblems = body.problems.map((p) => catalogProblemFrom(p));
+      // problems.mirror_of is a self FK; upsert roots before mirrors so a
+      // mirror whose pk sorts before its root cannot violate the constraint.
+      const byId = new Map(catalogProblems.map((p) => [p.externalId, p]));
+      const ordered: typeof catalogProblems = [];
+      const emitted = new Set<string>();
+      const emit = (p: (typeof catalogProblems)[number], guard: Set<string>): void => {
+        if (emitted.has(p.externalId) || guard.has(p.externalId)) return;
+        guard.add(p.externalId);
+        const parent = p.mirrorOf ? byId.get(p.mirrorOf) : undefined;
+        if (parent && !emitted.has(parent.externalId)) emit(parent, guard);
+        if (!emitted.has(p.externalId)) {
+          emitted.add(p.externalId);
+          ordered.push(p);
+        }
+      };
+      for (const p of catalogProblems) emit(p, new Set());
+      for (const p of ordered) {
         await db.upsertProblem(
           ctx.pool,
-          catalog.externalId,
-          catalog.code,
-          catalog.ownerOrganization,
-          catalog.isManuallyManaged,
-          catalog.mirrorOf,
-          catalog.mirrorRoot,
-          catalog.quotaBytes,
-          catalog.schemaVersion,
+          p.externalId,
+          p.code,
+          p.ownerOrganization,
+          p.isManuallyManaged,
+          p.mirrorOf,
+          p.mirrorRoot,
+          p.quotaBytes,
+          p.schemaVersion,
         );
       }
-      const catalogProblems = body.problems.map((p) => catalogProblemFrom(p));
       const missing = await db.markMissingOutsideCatalog(ctx.pool, catalogProblems.map((p) => p.externalId));
       const problemsTuple = catalogProblems.map((p) => [p.externalId, p.code] as [string, string]);
       const result = await ctx.rust.reconcile(problemsTuple);
