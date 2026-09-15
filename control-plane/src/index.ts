@@ -22,6 +22,9 @@ async function main(): Promise<void> {
 
   const app = Fastify({
     logger: false,
+    // A full catalog reconcile from a large OJ posts every problem in one
+    // request (~220 bytes each); the Fastify 1 MiB default 413s real sites.
+    bodyLimit: 32 * 1024 * 1024,
     genReqId: () => `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`,
     trustProxy: env.trustProxy,
     ajv: {
