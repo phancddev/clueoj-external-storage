@@ -139,22 +139,17 @@ services:
       - host.docker.internal:host-gateway
   celery-beat:
     image: vnoj/vnoj-celery
-    working_dir: /site/
-    volumes:
-      - ./repo/:/site/
     env_file:
       - environment/mysql.env
       - environment/site.env
       - environment/storage.env
-    command: celery -A dmoj.celery beat --loglevel=info
     extra_hosts:
       - host.docker.internal:host-gateway
+    entrypoint: ["celery", "-A", "dmoj_celery"]
+    command: ["beat", "-l", "info", "--schedule=/tmp/celerybeat-schedule"]
     networks:
       - site
       - db
-    depends_on:
-      - db
-      - redis
 ```
 
 Start ClueOJ with both files:
