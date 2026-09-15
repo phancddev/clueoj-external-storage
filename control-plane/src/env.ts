@@ -60,7 +60,7 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
 export function createPool(env: Env): Pool {
   const pool = new Pool({
     connectionString: env.databaseUrl,
-    max: 20,
+    max: Math.max(20, parsePositiveInt(process.env.STORAGE_PG_POOL_MAX, 20)),
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
   });

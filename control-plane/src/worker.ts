@@ -178,7 +178,7 @@ export class JobWorker {
   private async backfill(job: JobT, guard: () => Promise<void>): Promise<unknown> {
     const cfg = (job.result ?? {}) as { capability?: string; limit?: number };
     const capability = cfg.capability ?? 'accounting';
-    const limit = Math.min(cfg.limit ?? 25, 100);
+    const limit = Math.min(cfg.limit ?? 25, 500);
     const state = await this.ctx.pool.query('SELECT * FROM backfill_state WHERE capability = $1', [capability]);
     const cursor = state.rows[0]?.cursor_value as string | null | undefined;
     const page = await db.listProblems(this.ctx.pool, { cursor: cursor || undefined, limit, sort: 'external_id', order: 'asc' });

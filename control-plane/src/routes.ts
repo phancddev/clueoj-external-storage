@@ -951,6 +951,8 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
     const key = getIdempotencyKey(req, reply);
     if (!key) return;
     const capability = (req.params as { capability: string }).capability;
+    const bodyLimit = Number.parseInt(String((req.body as { limit?: unknown } | null)?.limit ?? ''), 10);
+    const pageLimit = Number.isFinite(bodyLimit) && bodyLimit > 0 ? Math.min(bodyLimit, 500) : 25;
     const valid = ['accounting', 'atomic_writes', 'r2_snapshot', 'direct_download', 'ensure_ready', 'eviction'];
     if (!valid.includes(capability)) {
       return reply.code(400).send({ code: 'bad_request', message: `Invalid capability: ${capability}`, retryable: false, request_id: getRequestId(req) });
@@ -975,7 +977,7 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
       leaseOwner: getAuth(req).sub,
       requestFingerprint: db.stableFingerprint({ action: 'backfill', capability }),
     });
-    await db.setJobPayload(ctx.pool, job.id, { capability, limit: 25 });
+    await db.setJobPayload(ctx.pool, job.id, { capability, limit: pageLimit });
     await audit(ctx, req, 'backfill.start', { metadata: { capability } });
     reply.code(202).send(accepted(job));
   });
