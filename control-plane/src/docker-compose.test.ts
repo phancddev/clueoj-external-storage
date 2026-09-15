@@ -63,6 +63,22 @@ describe('storage app docker-compose.yml', () => {
   });
 });
 
+function processArgv(svc: { entrypoint?: unknown; command?: unknown } | undefined): string {
+  const parts: string[] = [];
+  for (const value of [svc?.entrypoint, svc?.command]) {
+    if (Array.isArray(value)) {
+      parts.push(...value.map(String));
+    } else if (value) {
+      parts.push(String(value));
+    }
+  }
+  return parts.join(' ');
+}
+
+function dockerfileInstruction(source: string, instruction: string): string | undefined {
+  return source.split('\n').find((line) => line.startsWith(`${instruction} `));
+}
+
 describe.skipIf(!hasSiblingClueoj)('clueoj client-only storage override', () => {
   it('does not run storage services in the base ClueOJ compose file', () => {
     expect(clueojCompose!.services['storage-db']).toBeUndefined();
@@ -71,8 +87,33 @@ describe.skipIf(!hasSiblingClueoj)('clueoj client-only storage override', () => 
     expect(clueojCompose!.services['storage-web']).toBeUndefined();
   });
 
-  it('adds storage.env and host-gateway to site and celery only', () => {
-    for (const name of ['site', 'celery']) {
+  it('runs celery worker and celery-beat as separate processes', () => {
+    const worker = clueojCompose!.services['celery'];
+    const beat = clueojCompose!.services['celery-beat'];
+    expect(worker).toBeDefined();
+    expect(beat).toBeDefined();
+    const workerArgv = processArgv(worker);
+    const beatArgv = processArgv(beat);
+    expect(workerArgv).toMatch(/\bworker\b/);
+    expect(workerArgv).not.toMatch(/\bbeat\b/);
+    expect(beatArgv).toMatch(/\bbeat\b/);
+    expect(beatArgv).not.toMatch(/\bworker\b/);
+  });
+
+  it('keeps the celery image entrypoint as the celery executable without worker or beat', () => {
+    const dockerfilePath = resolve(__dirname, '../../../clueoj/celery/Dockerfile');
+    expect(existsSync(dockerfilePath)).toBe(true);
+    const dockerfile = readFileSync(dockerfilePath, 'utf-8');
+    const entrypoint = dockerfileInstruction(dockerfile, 'ENTRYPOINT');
+    const cmd = dockerfileInstruction(dockerfile, 'CMD');
+    expect(entrypoint).toBe('ENTRYPOINT ["celery", "-A", "dmoj_celery"]');
+    expect(cmd).toBe('CMD ["worker", "-l", "info", "--concurrency=2"]');
+    expect(entrypoint).not.toMatch(/\bworker\b/);
+    expect(entrypoint).not.toMatch(/\bbeat\b/);
+  });
+
+  it('adds storage.env and host-gateway to site, celery, and celery-beat', () => {
+    for (const name of ['site', 'celery', 'celery-beat']) {
       const svc = clueojStorageClientCompose!.services[name];
       expect(svc).toBeDefined();
       expect(svc.env_file).toContain('environment/storage.env');
@@ -88,6 +129,9 @@ describe.skipIf(!hasSiblingClueoj)('clueoj client-only storage override', () => 
     expect(svc.extra_hosts).toContain('host.docker.internal:host-gateway');
     expect(svc.networks).toContain('site');
     expect(svc.networks).toContain('db');
+    const beatArgv = processArgv(svc);
+    expect(beatArgv).toMatch(/\bbeat\b/);
+    expect(beatArgv).not.toMatch(/\bworker\b/);
   });
 
   it('does not define storage services in the client override', () => {
