@@ -1034,12 +1034,11 @@ pub async fn presign_canonical_from_manifest(
         .find(|f| f.path == canonical)
         .ok_or_else(|| AppError::ObjectNotFound("canonical download artifact".into()))?;
 
-    let filename = filename_override.unwrap_or_else(|| {
-        std::path::Path::new(&archive.path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "download".to_string())
-    });
+    let fallback_filename = std::path::Path::new(&archive.path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_string());
+    let filename = filename_override.unwrap_or(&fallback_filename);
 
     let meta = store.head_object(&archive.object_key).await?;
     if !meta.exists || meta.size != archive.size {
