@@ -123,7 +123,7 @@ async fn presign_uses_head_metadata_without_body_get_or_verify() {
         sha256: Some("abcd".to_string()),
         exists: true,
     });
-    let result = presign_canonical_from_manifest(&store, &manifest(), None)
+    let result = presign_canonical_from_manifest(&store, &manifest(), None, None)
         .await
         .unwrap();
 
@@ -142,7 +142,7 @@ async fn presign_rejects_missing_checksum_metadata() {
         sha256: None,
         exists: true,
     });
-    let result = presign_canonical_from_manifest(&store, &manifest(), None).await;
+    let result = presign_canonical_from_manifest(&store, &manifest(), None, None).await;
 
     assert!(matches!(result, Err(AppError::R2NotReady(_))));
     assert_eq!(store.presign_calls.load(Ordering::SeqCst), 0);
@@ -158,10 +158,25 @@ async fn presign_rejects_mismatched_checksum_metadata() {
         sha256: Some("efgh".to_string()),
         exists: true,
     });
-    let result = presign_canonical_from_manifest(&store, &manifest(), None).await;
+    let result = presign_canonical_from_manifest(&store, &manifest(), None, None).await;
 
     assert!(matches!(result, Err(AppError::ChecksumMismatch { .. })));
     assert_eq!(store.presign_calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.get_calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.verify_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn presign_prefers_problem_code_filename() {
+    let store = InstrumentedStore::new(ObjectMeta {
+        size: 4,
+        etag: None,
+        sha256: Some(manifest().files[0].sha256.clone()),
+    });
+    let result = presign_canonical_from_manifest(&store, &manifest(), None, Some("004d.zip"))
+        .await
+        .unwrap();
+
+    assert_eq!(store.presign_calls.load(Ordering::SeqCst), 1);
+    assert!(result.url.contains("filename=004d.zip"));
 }

@@ -806,7 +806,23 @@ impl SnapshotManager {
             .map_err(|e| AppError::Internal(format!("manifest parse: {e}")))?;
         validate_manifest(&manifest, problem_id, gen)?;
 
-        presign_canonical_from_manifest(self.store.as_ref(), &manifest, ttl).await
+        // Tên file tải về dùng mã bài (vd `004d.zip`): tên file nội bộ như
+        // `D.zip` là một trong các heuristic khiến browser gắn cờ tải xuống.
+        let code = self.problem_code(problem_id).await?;
+        let filename_override = code.map(|c| format!("{c}.zip"));
+
+        presign_canonical_from_manifest(self.store.as_ref(), &manifest, ttl, filename_override.as_deref()).await
+    }
+
+    async fn problem_code(&self, problem_id: &str) -> AppResult<Option<String>> {
+        let mut conn = self.db.acquire().await?;
+        let code = sqlx::query_scalar::<_, String>(
+            "SELECT code FROM problems WHERE external_id = $1 OR code = $1 LIMIT 1",
+        )
+        .bind(problem_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(code)
     }
 
     pub async fn delete_object(&self, object_key: &str, fencing_token: i64) -> AppResult<bool> {
@@ -999,18 +1015,14 @@ async fn restore_mode(path: &Path, mode: u32) -> AppResult<()> {
     let permissions = std::fs::Permissions::from_mode(mode & 0o777);
     tokio::fs::set_permissions(path, permissions)
         .await
-        .map_err(AppError::Io)
-}
-
-#[cfg(not(unix))]
-async fn restore_mode(_path: &Path, _mode: u32) -> AppResult<()> {
-    Ok(())
+        .map_err(|e| AppError::SpecialFile(format!("chmod {}: {e}", path.display())))
 }
 
 pub async fn presign_canonical_from_manifest(
     store: &dyn ObjectStore,
     manifest: &Manifest,
     ttl: Option<std::time::Duration>,
+    filename_override: Option<&str>,
 ) -> AppResult<PresignResult> {
     let canonical = manifest
         .canonical_download_path
@@ -1022,10 +1034,12 @@ pub async fn presign_canonical_from_manifest(
         .find(|f| f.path == canonical)
         .ok_or_else(|| AppError::ObjectNotFound("canonical download artifact".into()))?;
 
-    let filename = std::path::Path::new(&archive.path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "download".to_string());
+    let filename = filename_override.unwrap_or_else(|| {
+        std::path::Path::new(&archive.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "download".to_string())
+    });
 
     let meta = store.head_object(&archive.object_key).await?;
     if !meta.exists || meta.size != archive.size {
@@ -1042,9 +1056,8 @@ pub async fn presign_canonical_from_manifest(
         None => return Err(AppError::R2NotReady(manifest.problem_id.clone())),
     }
 
-    store.presign_get(&archive.object_key, &filename, ttl).await
+    store.presign_get(&archive.object_key, filename, ttl).await
 }
-
 async fn upload_manifest_file(
     db: PgPool,
     snapshot_id: uuid::Uuid,

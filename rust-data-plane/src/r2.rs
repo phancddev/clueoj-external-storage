@@ -17,7 +17,26 @@ use tokio::sync::RwLock;
 use crate::error::{AppError, AppResult};
 use crate::models::PresignResult;
 
-#[async_trait]
+/// Content-Type trả về trên presigned GET để trình duyệt phân loại đúng
+/// file thay vì rơi vào `binary/octet-stream` mặc định (một trong các
+/// heuristic khiến browser gắn cờ "file nguy hiểm").
+pub fn content_type_for_filename(filename: &str) -> &'static str {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".zip") {
+        "application/zip"
+    } else if lower.ends_with(".yml") || lower.ends_with(".yaml") {
+        "application/x-yaml"
+    } else if lower.ends_with(".json") {
+        "application/json"
+    } else if lower.ends_with(".cpp") || lower.ends_with(".cc") || lower.ends_with(".h") {
+        "text/x-c++src"
+    } else if lower.ends_with(".pdf") {
+        "application/pdf"
+    } else {
+        "application/octet-stream"
+    }
+}
+
 pub trait ObjectStore: Send + Sync {
     async fn put_object(&self, key: &str, body: Vec<u8>, sha256: &str) -> AppResult<()>;
     async fn put_object_from_path(&self, key: &str, path: &Path, sha256: &str) -> AppResult<()>;
@@ -277,6 +296,7 @@ impl ObjectStore for R2Client {
             .bucket(&self.bucket)
             .key(key)
             .response_content_disposition(disposition)
+            .response_content_type(content_type_for_filename(filename).to_string())
             .presigned(presign_cfg)
             .await
             .map_err(|e| AppError::R2(e.to_string()))?;
