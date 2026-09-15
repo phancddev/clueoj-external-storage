@@ -325,6 +325,34 @@ describe('DB contract hardening', () => {
     expect(pool.sql.match(/catalog_state IN \('present', 'mirror'\)/g)?.length).toBeGreaterThanOrEqual(4);
   });
 
+  it('dashboard summary separates measured local folders from complete R2 snapshots', async () => {
+    let sql = '';
+    const pool = {
+      query: async (query: string) => {
+        sql = query;
+        return {
+          rows: [{
+            local_problem_count: 63,
+            local_allocated_bytes: '9424896',
+            r2_snapshot_problem_count: 111,
+            r2_snapshot_bytes: '483906749',
+          }],
+          rowCount: 1,
+        };
+      },
+    };
+
+    const result = await db.getDashboardSummary(pool as any);
+
+    expect(result.local_problem_count).toBe(63);
+    expect(result.local_allocated_bytes).toBe(9424896);
+    expect(result.r2_snapshot_problem_count).toBe(111);
+    expect(result.r2_snapshot_bytes).toBe(483906749);
+    expect(sql).toContain("pu.local_status = 'present'");
+    expect(sql).toContain("s.state = 'ready'");
+    expect(sql).toContain('SUM(s.total_bytes)');
+  });
+
   it('lists each problem with its logical size in the same query', async () => {
     let sql = '';
     const pool = {

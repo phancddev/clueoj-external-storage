@@ -1967,7 +1967,29 @@ export async function getDashboardSummary(pool: Pool): Promise<Record<string, un
        COALESCE(SUM(pu.logical_bytes) FILTER (WHERE p.catalog_state IN ('present', 'mirror')), 0)::bigint AS logical_bytes,
        COALESCE(SUM(pu.allocated_bytes) FILTER (WHERE p.catalog_state IN ('present', 'mirror')), 0)::bigint AS allocated_bytes,
        COALESCE(SUM(pu.archive_bytes) FILTER (WHERE p.catalog_state IN ('present', 'mirror')), 0)::bigint AS archive_bytes,
-       COALESCE(SUM(pu.auxiliary_bytes) FILTER (WHERE p.catalog_state IN ('present', 'mirror')), 0)::bigint AS auxiliary_bytes
+       COALESCE(SUM(pu.auxiliary_bytes) FILTER (WHERE p.catalog_state IN ('present', 'mirror')), 0)::bigint AS auxiliary_bytes,
+       COUNT(*) FILTER (
+         WHERE p.catalog_state IN ('present', 'mirror')
+           AND pu.local_status = 'present'
+       )::int AS local_problem_count,
+       COALESCE(SUM(pu.allocated_bytes) FILTER (
+         WHERE p.catalog_state IN ('present', 'mirror')
+           AND pu.local_status = 'present'
+       ), 0)::bigint AS local_allocated_bytes,
+       (
+         SELECT COUNT(*)::int
+         FROM snapshots s
+         JOIN problems sp ON sp.external_id = s.problem_id
+         WHERE s.state = 'ready'
+           AND sp.catalog_state IN ('present', 'mirror')
+       ) AS r2_snapshot_problem_count,
+       (
+         SELECT COALESCE(SUM(s.total_bytes), 0)::bigint
+         FROM snapshots s
+         JOIN problems sp ON sp.external_id = s.problem_id
+         WHERE s.state = 'ready'
+           AND sp.catalog_state IN ('present', 'mirror')
+       ) AS r2_snapshot_bytes
      FROM problems p
      LEFT JOIN problem_usage pu ON pu.problem_id = p.external_id`,
   );
