@@ -40,6 +40,7 @@ pub fn content_type_for_filename(filename: &str) -> &'static str {
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     async fn put_object(&self, key: &str, body: Vec<u8>, sha256: &str) -> AppResult<()>;
+    async fn put_object_overwrite(&self, key: &str, body: Vec<u8>, sha256: &str) -> AppResult<()>;
     async fn put_object_from_path(&self, key: &str, path: &Path, sha256: &str) -> AppResult<()>;
     async fn get_object(&self, key: &str) -> AppResult<Bytes>;
     async fn get_object_to_path(&self, key: &str, path: &Path) -> AppResult<String>;
@@ -122,6 +123,13 @@ impl ObjectStore for R2Client {
                 got: format!("existing object differs at {key}"),
             });
         }
+        self.put_object_overwrite(key, body, sha256).await
+    }
+
+    // Manifest keys are generation-addressed, not content-addressed; the run
+    // that owns the snapshot row supersedes whatever an earlier attempt of the
+    // same generation left behind (timestamps differ per attempt).
+    async fn put_object_overwrite(&self, key: &str, body: Vec<u8>, sha256: &str) -> AppResult<()> {
         let body = ByteStream::from(body);
         self.client
             .put_object()
@@ -132,7 +140,6 @@ impl ObjectStore for R2Client {
             .send()
             .await
             .map_err(|e| AppError::R2(e.to_string()))?;
-        tracing::debug!(key, sha256, "object uploaded");
         Ok(())
     }
 
@@ -456,6 +463,12 @@ impl ObjectStore for InMemoryStore {
                 got: crate::hasher::sha256_bytes(&body),
             });
         }
+        objects.insert(key.to_string(), body);
+        Ok(())
+    }
+
+    async fn put_object_overwrite(&self, key: &str, body: Vec<u8>, _sha256: &str) -> AppResult<()> {
+        let mut objects = self.objects.write().await;
         objects.insert(key.to_string(), body);
         Ok(())
     }

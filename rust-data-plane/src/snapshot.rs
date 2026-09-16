@@ -299,8 +299,10 @@ impl SnapshotManager {
         };
         let manifest_json = serde_json::to_vec(&manifest)?;
         let manifest_sha = crate::hasher::sha256_bytes(&manifest_json);
+        // Generation-addressed key: a takeover retry of the same generation
+        // must supersede the manifest an earlier attempt published.
         self.store
-            .put_object(&mkey, manifest_json, &manifest_sha)
+            .put_object_overwrite(&mkey, manifest_json, &manifest_sha)
             .await?;
         if !self.store.verify_object(&mkey, &manifest_sha).await? {
             return Err(AppError::R2(format!(

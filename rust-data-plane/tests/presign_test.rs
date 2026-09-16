@@ -33,6 +33,9 @@ impl ObjectStore for InstrumentedStore {
         unreachable!("presign must not upload")
     }
 
+    async fn put_object_overwrite(&self, _key: &str, _body: Vec<u8>, _sha256: &str) -> AppResult<()> {
+        unreachable!("presign must not upload")
+    }
     async fn put_object_from_path(
         &self,
         _key: &str,
