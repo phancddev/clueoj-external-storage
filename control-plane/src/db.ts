@@ -252,21 +252,31 @@ export async function scheduleAutoSnapshotJobs(pool: Pool, problem: ProblemT, ac
   if (!problem.dirty) return null;
   const generation = problem.dirty_generation ?? await allocateGeneration(pool, problem.external_id);
   const dirtyVersion = problem.dirty_version;
+  // createJob replays an existing idempotency key verbatim, so a failed
+  // earlier attempt would otherwise be "scheduled" forever without ever
+  // running again. Scope the key by how many attempts already finished so
+  // each reschedule round enqueues a fresh job pair.
+  const { rows } = await pool.query(
+    `SELECT count(*)::int AS finished FROM jobs
+     WHERE problem_id = $1 AND job_type = 'snapshot' AND state IN ('failed', 'cancelled', 'completed')`,
+    [problem.external_id],
+  );
+  const round = (rows[0]?.finished ?? 0) + 1;
   const scan = await createJob(pool, {
-    idempotencyKey: `auto-scan:${problem.external_id}:${dirtyVersion}`,
+    idempotencyKey: `auto-scan:${problem.external_id}:${dirtyVersion}:${round}`,
     jobType: 'scan',
     problemId: problem.external_id,
     targetGeneration: null,
     leaseOwner: actor,
-    requestFingerprint: stableFingerprint({ action: 'auto-scan', external_id: problem.external_id, dirty_version: dirtyVersion }),
+    requestFingerprint: stableFingerprint({ action: 'auto-scan', external_id: problem.external_id, dirty_version: dirtyVersion, round }),
   });
   const snapshot = await createJob(pool, {
-    idempotencyKey: `auto-snapshot:${problem.external_id}:${dirtyVersion}`,
+    idempotencyKey: `auto-snapshot:${problem.external_id}:${dirtyVersion}:${round}`,
     jobType: 'snapshot',
     problemId: problem.external_id,
     targetGeneration: generation,
     leaseOwner: actor,
-    requestFingerprint: stableFingerprint({ action: 'auto-snapshot', external_id: problem.external_id, generation, dirty_version: dirtyVersion }),
+    requestFingerprint: stableFingerprint({ action: 'auto-snapshot', external_id: problem.external_id, generation, dirty_version: dirtyVersion, round }),
   });
   await setJobPayload(pool, snapshot.id, { dirty_version: dirtyVersion, auto_push: true });
   return { scan_job_id: scan.id, snapshot_job_id: snapshot.id };
