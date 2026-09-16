@@ -293,6 +293,23 @@ describe('DB contract hardening', () => {
     expect(sqlBeforeForUpdate(pool.calls[0])).not.toContain('ROW_NUMBER() OVER');
   });
 
+  it('restore lane only claims restore jobs and skips queued snapshot bulk work', async () => {
+    const pool = new AcquirePool();
+    await db.acquireJob(pool as unknown as Parameters<typeof db.acquireJob>[0], 'worker-restore', 60, 'restore');
+    const sql = pool.calls[pool.calls.length - 1];
+    expect(sql).toContain("AND job_type = 'restore'");
+    expect(sql).toContain('ORDER BY created_at ASC, id ASC');
+    expect(sql).not.toContain('DESC, created_at');
+  });
+
+  it('bulk lane prefers restore jobs ahead of older snapshot work', async () => {
+    const pool = new AcquirePool();
+    await db.acquireJob(pool as unknown as Parameters<typeof db.acquireJob>[0], 'worker-bulk', 60, 'bulk');
+    const sql = pool.calls[pool.calls.length - 1];
+    expect(sql).toContain("ORDER BY (job_type = 'restore') DESC, created_at ASC, id ASC");
+    expect(sql).not.toContain("AND job_type = 'restore'");
+  });
+
   it('cancelling a running job revokes its stale Rust fencing token atomically', async () => {
     const pool = new RevokePool();
     const job = await db.cancelJob(pool as any, baseJob.id, 'stop');

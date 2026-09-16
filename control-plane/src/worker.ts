@@ -21,9 +21,14 @@ export class JobWorker {
   start(): void {
     if (this.running) return;
     // N parallel loops share the DB lease queue; acquireJob + fencing tokens
-    // already guarantee two workers never claim the same job.
+    // already guarantee two workers never claim the same job. The first
+    // `restoreReserved` loops claim only restore jobs so a submission-triggered
+    // restore never queues behind snapshot/evict/backfill bulk work; the rest
+    // claim any job, restores first, so idle bulk slots still help drain them.
+    const total = this.ctx.env.workerConcurrency;
+    const reserved = Math.min(this.ctx.env.restoreReservedConcurrency, total);
     this.running = Promise.all(
-      Array.from({ length: this.ctx.env.workerConcurrency }, () => this.loop()),
+      Array.from({ length: total }, (_, i) => this.loop(i < reserved ? 'restore' : 'bulk')),
     ).then(() => undefined);
   }
 
@@ -32,13 +37,13 @@ export class JobWorker {
     await this.running;
   }
 
-  private async loop(): Promise<void> {
+  private async loop(lane: db.JobLane): Promise<void> {
     while (!this.stopped) {
       try {
         await db.failExpiredRunningJobs(this.ctx.pool);
-        const job = await db.acquireJob(this.ctx.pool, this.workerId, this.ctx.env.workerLeaseSeconds);
+        const job = await db.acquireJob(this.ctx.pool, this.workerId, this.ctx.env.workerLeaseSeconds, lane);
         if (!job) {
-          await sleep(1000);
+          await sleep(lane === 'restore' ? 250 : 1000);
           continue;
         }
         await this.runJob(job);

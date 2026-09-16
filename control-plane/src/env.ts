@@ -13,6 +13,7 @@ export interface Env {
   trustProxy: boolean;
   workerEnabled: boolean;
   workerConcurrency: number;
+  restoreReservedConcurrency: number;
   workerLeaseSeconds: number;
   presignTtlSeconds: number;
   port: number;
@@ -43,6 +44,10 @@ export function loadEnv(): Env {
     trustProxy: process.env.STORAGE_TRUST_PROXY === 'true',
     workerEnabled: process.env.STORAGE_WORKER_ENABLED !== 'false',
     workerConcurrency: Math.max(1, parsePositiveInt(process.env.STORAGE_WORKER_CONCURRENCY, 1)),
+    restoreReservedConcurrency: Math.min(
+      Math.max(1, parsePositiveInt(process.env.STORAGE_WORKER_CONCURRENCY, 1)),
+      parseReservedRestore(process.env.STORAGE_RESTORE_RESERVED_CONCURRENCY, 2),
+    ),
     workerLeaseSeconds: parsePositiveInt(process.env.STORAGE_WORKER_LEASE_SECONDS, 60),
     presignTtlSeconds: parsePositiveInt(process.env.R2_PRESIGN_TTL_SECONDS, 180),
     port: parsePositiveInt(process.env.STORAGE_PORT, 2907),
@@ -50,6 +55,14 @@ export function loadEnv(): Env {
     dashboardDir: process.env.STORAGE_DASHBOARD_DIR || '../dashboard/dist',
     problemRootContainer: process.env.STORAGE_PROBLEM_ROOT_CONTAINER || '/problems',
   };
+}
+
+// 0 disables the dedicated restore lane; otherwise clamp into [0, workerConcurrency].
+function parseReservedRestore(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return parsed;
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {

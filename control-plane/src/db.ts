@@ -1232,7 +1232,9 @@ async function allocateGenerationOnClient(client: Pick<Pool | PoolClient, 'query
   return Number(rows[0].generation);
 }
 
-export async function acquireJob(pool: Pool, workerId: string, leaseSeconds: number): Promise<JobT | null> {
+export type JobLane = 'restore' | 'bulk';
+
+export async function acquireJob(pool: Pool, workerId: string, leaseSeconds: number, lane: JobLane = 'bulk'): Promise<JobT | null> {
   await failExpiredRunningJobs(pool);
   let rows: Record<string, unknown>[];
   try {
@@ -1244,7 +1246,8 @@ export async function acquireJob(pool: Pool, workerId: string, leaseSeconds: num
            (state = 'pending' AND NOT EXISTS (SELECT 1 FROM queue_state WHERE name = 'default' AND paused))
            OR (state = 'running' AND lease_expires_at < now())
          )
-       ORDER BY created_at ASC, id ASC
+         ${lane === 'restore' ? "AND job_type = 'restore'" : ''}
+       ORDER BY ${lane === 'restore' ? 'created_at ASC, id ASC' : "(job_type = 'restore') DESC, created_at ASC, id ASC"}
        FOR UPDATE SKIP LOCKED
        LIMIT 1
      ), token AS (
