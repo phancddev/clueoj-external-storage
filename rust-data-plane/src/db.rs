@@ -567,7 +567,7 @@ pub async fn acquire_dirty_snapshot_job_by_code(
                error_code = NULL,
                error_message = NULL
            WHERE j.problem_id = $1 AND j.job_type = 'snapshot' AND j.state = 'pending'
-           RETURNING j.id, j.target_generation, (SELECT fencing_token FROM token)"#,
+           RETURNING j.id, j.target_generation::BIGINT, (SELECT fencing_token FROM token)"#,
     )
     .bind(&row.external_id)
     .bind(lease_owner)
