@@ -170,10 +170,16 @@ export async function upsertProblem(
 
 export async function markMissingOutsideCatalog(pool: Pool, externalIds: string[]): Promise<number> {
   if (externalIds.length === 0) return 0;
+  // A full reconcile lists every OJ problem, so anything absent here has been
+  // deleted on the OJ. Mark them as tombstones (not "missing"): the delete
+  // notification from the OJ is fire-and-forget and a 409/network drop would
+  // otherwise lose the tombstone forever, hiding the problem from the
+  // deleted listing. Both states already emit event_kind=delete to sync.
   const { rowCount } = await pool.query(
     `UPDATE problems
-     SET catalog_state = 'missing', observed_at = now(), stale = false
-     WHERE catalog_state <> 'orphan' AND NOT (external_id = ANY($1::text[]))`,
+     SET catalog_state = 'deleted', observed_at = now(), stale = false
+     WHERE catalog_state IN ('present', 'mirror', 'missing')
+       AND NOT (external_id = ANY($1::text[]))`,
     [externalIds],
   );
   return rowCount ?? 0;
