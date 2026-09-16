@@ -390,9 +390,19 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
     const key = getIdempotencyKey(req, reply);
     if (!key) return;
     const q = (req.body ?? {}) as { limit?: number };
-    const scheduled = await db.scheduleDirtySnapshotBatch(ctx.pool, getAuth(req).sub, Math.min(Math.max(q.limit ?? 100, 1), 500));
-    await audit(ctx, req, 'catalog.snapshots_schedule', { metadata: { scheduled: scheduled.length } });
-    reply.send({ items: scheduled, count: scheduled.length });
+    try {
+      const scheduled = await db.scheduleDirtySnapshotBatch(ctx.pool, getAuth(req).sub, Math.min(Math.max(q.limit ?? 100, 1), 500));
+      await audit(ctx, req, 'catalog.snapshots_schedule', { metadata: { scheduled: scheduled.length } });
+      reply.send({ items: scheduled, count: scheduled.length });
+    } catch (err) {
+      // A batch sweep races the watcher/dirty path for individual problems;
+      // an active-operation conflict on one problem must not abort the rest.
+      if (err instanceof db.ProblemOperationConflictError) {
+        reply.code(409).send({ code: 'problem_operation_conflict', message: err.message, retryable: true, request_id: getRequestId(req) });
+        return;
+      }
+      throw err;
+    }
   });
 
   // ======================================================================

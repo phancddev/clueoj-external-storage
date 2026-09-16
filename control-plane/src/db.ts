@@ -287,11 +287,22 @@ export async function scheduleDirtySnapshotBatch(pool: Pool, actor: string, limi
     [limit],
   );
   const scheduled = [];
+  let skipped = 0;
   for (const row of rows) {
     const problem = rowToProblem(row);
-    const dirty = problem.dirty ? problem : await markDirtyIfNoReady(pool, problem.external_id) ?? problem;
-    const jobs = await scheduleAutoSnapshotJobs(pool, dirty, actor);
-    if (jobs) scheduled.push({ problem_id: problem.external_id, ...jobs });
+    try {
+      const dirty = problem.dirty ? problem : await markDirtyIfNoReady(pool, problem.external_id) ?? problem;
+      const jobs = await scheduleAutoSnapshotJobs(pool, dirty, actor);
+      if (jobs) scheduled.push({ problem_id: problem.external_id, ...jobs });
+    } catch (err) {
+      // The watcher or an ensure-ready call already owns an active operation
+      // for this problem; skip it and let that flow finish the snapshot.
+      if (err instanceof ProblemOperationConflictError) {
+        skipped++;
+        continue;
+      }
+      throw err;
+    }
   }
   return scheduled;
 }
