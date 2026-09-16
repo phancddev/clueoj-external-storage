@@ -16,6 +16,7 @@ const SnapshotsPage = lazy(() => import('@/pages/snapshots').then((module) => ({
 const JobsPage = lazy(() => import('@/pages/jobs').then((module) => ({ default: module.JobsPage })));
 const StoragePage = lazy(() => import('@/pages/storage').then((module) => ({ default: module.StoragePage })));
 const OrphansPage = lazy(() => import('@/pages/orphans').then((module) => ({ default: module.OrphansPage })));
+const DeletedPage = lazy(() => import('@/pages/deleted').then((module) => ({ default: module.DeletedPage })));
 const AuditPage = lazy(() => import('@/pages/audit').then((module) => ({ default: module.AuditPage })));
 const SettingsPage = lazy(() => import('@/pages/settings').then((module) => ({ default: module.SettingsPage })));
 
@@ -75,6 +76,7 @@ function matchRoute(hash: string): { page: string; param?: string } {
   if (parts[0] === 'jobs') return { page: 'jobs' };
   if (parts[0] === 'storage') return { page: 'storage' };
   if (parts[0] === 'orphans') return { page: 'orphans' };
+  if (parts[0] === 'deleted') return { page: 'deleted' };
   if (parts[0] === 'audit') return { page: 'audit' };
   if (parts[0] === 'settings') return { page: 'settings' };
   return { page: 'overview' };
@@ -96,6 +98,7 @@ function pageTitle(page: string) {
     jobs: 'Jobs',
     storage: 'Storage & R2',
     orphans: 'Orphans',
+    deleted: 'Deleted problems',
     audit: 'Audit log',
     settings: 'Settings',
   };
@@ -205,6 +208,9 @@ function Router() {
       break;
     case 'storage':
       pageContent = <StoragePage />;
+      break;
+    case 'deleted':
+      pageContent = <DeletedPage />;
       break;
     case 'orphans':
       pageContent = <OrphansPage />;

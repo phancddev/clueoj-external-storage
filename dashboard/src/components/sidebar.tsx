@@ -16,6 +16,7 @@ import {
   LogOut,
   Menu,
   Settings,
+  Trash2,
   Users,
 } from 'lucide-react';
 
@@ -34,6 +35,7 @@ export const navItems: NavItem[] = [
   { label: 'Jobs', to: '#/jobs', icon: Boxes, description: 'Background jobs' },
   { label: 'Storage & R2', to: '#/storage', icon: HardDrive, description: 'Volumes and R2 status' },
   { label: 'Orphans', to: '#/orphans', icon: AlertTriangle, description: 'Unassigned folders' },
+  { label: 'Deleted', to: '#/deleted', icon: Trash2, description: 'Deleted problems' },
   { label: 'Audit log', to: '#/audit', icon: History, description: 'Audit events' },
   { label: 'Settings', to: '#/settings', icon: Settings, description: 'Settings' },
 ];
