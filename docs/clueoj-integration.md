@@ -191,7 +191,8 @@ STORAGE_ENSURE_READY_ENABLED=false
 STORAGE_ENSURE_READY_MAX_ATTEMPTS=12
 STORAGE_ENSURE_READY_RETRY_BASE_SECONDS=5
 STORAGE_ENSURE_READY_RETRY_MAX_SECONDS=60
-STORAGE_ENSURE_READY_DEGRADED_DISPATCH=false
+# ClueOJ dispatches directly when local test data is usable; ensure-ready is
+# used only to restore a missing local problem from a READY snapshot.
 ```
 
 Do not copy `R2_*`, `POSTGRES_*`, `STORAGE_DATABASE_URL`,
