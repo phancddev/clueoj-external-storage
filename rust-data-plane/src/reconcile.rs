@@ -67,8 +67,7 @@ async fn apply_reconcile_plan(
     }
 
     for item in &plan.missing_known {
-        db::upsert_problem_usage(db, &item.external_id, &item.code, 0, 0, 0, 0, 0, "missing")
-            .await?;
+        db::upsert_missing_usage(db, &item.external_id).await?;
     }
 
     for code in &plan.orphans {

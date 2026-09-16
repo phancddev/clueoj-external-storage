@@ -120,6 +120,51 @@ pub async fn upsert_problem_usage(
     Ok(())
 }
 
+/// Mark a problem's local folder missing without erasing its accounting.
+///
+/// Evicted problems live on R2: keep the last-known local sizes and never
+/// regress below the latest READY snapshot, so dashboards keep showing the
+/// problem's real data size instead of 0 B.
+pub async fn upsert_missing_usage(pool: &PgPool, problem_id: &str) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO problem_usage
+            (problem_id, logical_bytes, allocated_bytes, archive_bytes,
+             auxiliary_bytes, file_count, local_status, r2_status, snapshot_generation,
+             orphan_bytes, referenced_bytes, observed_at, stale)
+        VALUES ($1, 0, 0, 0, 0, 0, 'missing', 'none', NULL, 0, 0, NOW(), false)
+        ON CONFLICT (problem_id) DO UPDATE SET
+            local_status = 'missing',
+            allocated_bytes = 0,
+            auxiliary_bytes = 0,
+            observed_at = EXCLUDED.observed_at,
+            stale = false,
+            logical_bytes = GREATEST(
+                problem_usage.logical_bytes,
+                COALESCE((SELECT s.total_bytes FROM snapshots s
+                          WHERE s.problem_id = problem_usage.problem_id
+                            AND s.state = 'ready'
+                          ORDER BY s.generation DESC LIMIT 1), 0)),
+            archive_bytes = GREATEST(
+                problem_usage.archive_bytes,
+                COALESCE((SELECT s.total_bytes FROM snapshots s
+                          WHERE s.problem_id = problem_usage.problem_id
+                            AND s.state = 'ready'
+                          ORDER BY s.generation DESC LIMIT 1), 0)),
+            file_count = GREATEST(
+                problem_usage.file_count,
+                COALESCE((SELECT s.file_count FROM snapshots s
+                          WHERE s.problem_id = problem_usage.problem_id
+                            AND s.state = 'ready'
+                          ORDER BY s.generation DESC LIMIT 1), 0))
+        "#,
+    )
+    .bind(problem_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_problem(
     pool: &PgPool,
