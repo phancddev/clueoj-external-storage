@@ -1014,7 +1014,14 @@ async fn restore_mode(path: &Path, mode: u32) -> AppResult<()> {
     if mode == 0 {
         return Ok(());
     }
-    let permissions = std::fs::Permissions::from_mode(mode & 0o777);
+    // Judges read restored problem data as a non-root user, while the storage
+    // runtime may restore as root. A manifest mode like 0600 (Django's upload
+    // default) would leave the file unreadable and strand every submission for
+    // the problem in the judge queue. Floor restored regular files at
+    // group/other read, and group/other execute when the owner may execute.
+    let bits = mode & 0o777;
+    let floor = if bits & 0o100 != 0 { 0o055 } else { 0o044 };
+    let permissions = std::fs::Permissions::from_mode(bits | floor);
     tokio::fs::set_permissions(path, permissions)
         .await
         .map_err(|e| AppError::SpecialFile(format!("chmod {}: {e}", path.display())))

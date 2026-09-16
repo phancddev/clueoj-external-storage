@@ -201,6 +201,26 @@ async fn test_restore_materializes_modes_and_hardlinks() {
         symlink_target: None,
         object_key: object_key.clone(),
     };
+    let private_data = b"private-archive".to_vec();
+    let private_sha = rust_data_plane::hasher::sha256_bytes(&private_data);
+    let private_key = rust_data_plane::models::object_key_for_sha256(&private_sha);
+    store
+        .put_object(&private_key, private_data.clone(), &private_sha)
+        .await
+        .unwrap();
+    let private = ManifestFile {
+        path: "D.zip".to_string(),
+        sha256: private_sha,
+        size: private_data.len() as u64,
+        allocated_bytes: private_data.len() as u64,
+        mode: 0o100600,
+        dev: 1,
+        ino: 4,
+        nlink: 1,
+        duplicate_of: None,
+        symlink_target: None,
+        object_key: private_key,
+    };
     let duplicate = ManifestFile {
         path: "bin/runner-link".to_string(),
         duplicate_of: Some(regular.path.clone()),
@@ -212,10 +232,10 @@ async fn test_restore_materializes_modes_and_hardlinks() {
         code: "sum".to_string(),
         generation: 1,
         created_at: chrono::Utc::now(),
-        files: vec![regular, duplicate],
+        files: vec![regular, duplicate, private],
         canonical_download_path: None,
-        total_bytes: data.len() as u64,
-        file_count: 2,
+        total_bytes: (data.len() * 2 + private_data.len()) as u64,
+        file_count: 3,
     };
     let dir = tempfile::tempdir().unwrap();
 
@@ -228,6 +248,9 @@ async fn test_restore_materializes_modes_and_hardlinks() {
     assert_eq!(first.ino(), second.ino());
     assert_eq!(first.permissions().mode() & 0o777, 0o755);
     assert_eq!(std::fs::read(dir.path().join("bin/runner")).unwrap(), data);
+    let private_meta = std::fs::metadata(dir.path().join("D.zip")).unwrap();
+    assert_eq!(private_meta.permissions().mode() & 0o777, 0o644);
+    assert_eq!(std::fs::read(dir.path().join("D.zip")).unwrap(), private_data);
 }
 
 #[cfg(unix)]
