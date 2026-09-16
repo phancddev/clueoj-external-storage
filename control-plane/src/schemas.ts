@@ -323,6 +323,7 @@ export const ReconcileResult = Type.Object({
   missing: Type.Integer({ minimum: 0 }),
   orphan: Type.Integer({ minimum: 0 }),
   mirror: Type.Integer({ minimum: 0 }),
+  scheduled_backups: Type.Optional(Type.Integer({ minimum: 0 })),
   job_id: Type.Optional(Type.String()),
 });
 export type ReconcileResultT = Static<typeof ReconcileResult>;

@@ -357,9 +357,16 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
         );
       }
       const missing = await db.markMissingOutsideCatalog(ctx.pool, catalogProblems.map((p) => p.externalId));
-      const problemsTuple = catalogProblems.map((p) => [p.externalId, p.code] as [string, string]);
-      const result = await ctx.rust.reconcile(problemsTuple);
+      // The rust data plane re-scans every problem folder during reconcile
+      // (6k+ folders, ~10 minutes) and already self-heals the same
+      // projections on startup and on its periodic loop. Calling it inline
+      // made this endpoint exceed every caller's HTTP timeout, so the OJ's
+      // "reconcile now" action died before scheduling any backup jobs —
+      // which is how problems ended up with no R2 snapshot at all. Skip the
+      // rescan here; per-problem usage comes from the catalog and the sync
+      // projection, and backups are what this endpoint must schedule.
       await db.clearDirtyForMissingLocal(ctx.pool);
+      let scheduledBackups = 0;
       for (const catalog of catalogProblems) {
         if (catalog.catalogState !== 'present') continue;
         const usage = await db.getProblemUsage(ctx.pool, catalog.externalId);
@@ -369,14 +376,16 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
         const dirty = problem.dirty
           ? problem
           : await db.markDirtyIfNoReady(ctx.pool, problem.external_id) ?? problem;
-        await db.scheduleAutoSnapshotJobs(ctx.pool, dirty, 'catalog-reconcile');
+        const jobs = await db.scheduleAutoSnapshotJobs(ctx.pool, dirty, 'catalog-reconcile');
+        if (jobs) scheduledBackups++;
       }
       const normalized = {
-        discovered: result.discovered ?? 0,
+        discovered: catalogProblems.length,
         present: body.problems.length,
-        missing: result.missing ?? missing,
-        orphan: result.orphans ?? 0,
-        mirror: result.mirrors ?? 0,
+        missing,
+        orphan: 0,
+        mirror: 0,
+        scheduled_backups: scheduledBackups,
       };
       await audit(ctx, req, 'catalog.reconcile', { metadata: { ...normalized, count: body.problems.length } });
       reply.send(normalized);
