@@ -191,22 +191,29 @@ async fn snapshot_dirty_code(
         .await?;
         db::assert_job_lease(db, job_id, &worker_id, fencing_token).await?;
         let mgr = SnapshotManager::new(db.clone(), store);
-        let snap = mgr
-            .create_snapshot(
+        let (snap, run_upload) = mgr
+            .claim_snapshot(&problem_id, generation, fencing_token)
+            .await?;
+        if run_upload {
+            mgr.run_snapshot_upload(
+                snap.id,
                 &problem_id,
                 generation,
                 fencing_token,
                 Some(dirty_version),
                 root,
                 &scan,
+                snap.created_at,
             )
             .await?;
+        }
+        let snap_id = snap.id;
         db::complete_job(
             db,
             job_id,
             &worker_id,
             fencing_token,
-            serde_json::json!({"snapshot_id": snap.id, "generation": generation}),
+            serde_json::json!({"snapshot_id": snap_id, "generation": generation}),
         )
         .await?;
         Ok(())

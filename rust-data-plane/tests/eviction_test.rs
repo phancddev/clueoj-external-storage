@@ -84,8 +84,13 @@ async fn guarded_eviction_and_restore_round_trip() {
     let scan = scanner::scan_problem_folder(root.path(), "sum").expect("scan problem");
     let store = Arc::new(InMemoryStore::new(Duration::from_secs(180)));
     let manager = SnapshotManager::new(pool.clone(), store);
+    let (snap, run_upload) = manager
+        .claim_snapshot("p-evict", 1, 1)
+        .await
+        .expect("claim snapshot");
+    assert!(run_upload);
     manager
-        .create_snapshot("p-evict", 1, 1, Some(0), root.path(), &scan)
+        .run_snapshot_upload(snap.id, "p-evict", 1, 1, Some(0), root.path(), &scan, snap.created_at)
         .await
         .expect("create READY snapshot");
     sqlx::query(

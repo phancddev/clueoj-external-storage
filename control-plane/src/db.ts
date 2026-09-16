@@ -902,6 +902,30 @@ export async function getSnapshot(pool: Pool, id: string): Promise<SnapshotT | n
   return rows[0] ? rowToSnapshot(rows[0]) : null;
 }
 
+export async function getSnapshotByGeneration(pool: Pool, problemId: string, generation: number): Promise<SnapshotT | null> {
+  const { rows } = await pool.query(
+    'SELECT * FROM snapshots WHERE problem_id = $1 AND generation = $2',
+    [problemId, generation],
+  );
+  return rows[0] ? rowToSnapshot(rows[0]) : null;
+}
+
+// Snapshots whose uploader died (process restart mid-upload) would otherwise
+// sit in a non-terminal state forever; the data plane only takes over rows
+// stale for 30 minutes, so sweep anything non-terminal after 6 hours.
+export async function failStalledSnapshots(pool: Pool): Promise<number> {
+  const { rowCount } = await pool.query(
+    `UPDATE snapshots
+     SET state = 'error',
+         error_code = 'stalled',
+         error_message = 'snapshot stalled in a non-terminal state (no live uploader)',
+         completed_at = now()
+     WHERE state IN ('discovered', 'hashing', 'uploading', 'verifying')
+       AND created_at < now() - interval '6 hours'`,
+  );
+  return rowCount ?? 0;
+}
+
 function rowToSnapshot(r: Record<string, unknown>): SnapshotT {
   return {
     id: String(r.id),

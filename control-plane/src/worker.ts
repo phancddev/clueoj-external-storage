@@ -41,6 +41,7 @@ export class JobWorker {
     while (!this.stopped) {
       try {
         await db.failExpiredRunningJobs(this.ctx.pool);
+        await db.failStalledSnapshots(this.ctx.pool);
         const job = await db.acquireJob(this.ctx.pool, this.workerId, this.ctx.env.workerLeaseSeconds, lane);
         if (!job) {
           await sleep(lane === 'restore' ? 250 : 1000);
@@ -143,10 +144,31 @@ export class JobWorker {
     const payload = (job.result ?? {}) as { dirty_version?: number | string | null };
     const dirtyVersion = payload.dirty_version ?? null;
     const snap = await this.ctx.rust.createSnapshot(problem.external_id, job.target_generation, problem.code, job.fencing_token, dirtyVersion);
-    if (String(snap.state).toLowerCase() === 'ready') {
-      await db.clearDirtyAfterSnapshotForJob(this.ctx.pool, job, problem.external_id, job.target_generation, dirtyVersion);
+    // The data plane uploads in a background task and records the terminal
+    // state in the database; poll the snapshot row so this job tracks real
+    // progress instead of dying to an HTTP timeout on multi-hundred-MB
+    // uploads.
+    let state = String(snap.state).toLowerCase();
+    const deadline = Date.now() + SNAPSHOT_WAIT_MS;
+    while (state !== 'ready' && state !== 'error' && state !== 'superseded') {
+      if (Date.now() > deadline) {
+        throw new Error(`snapshot did not reach a terminal state within ${SNAPSHOT_WAIT_MS}ms (last state: ${state})`);
+      }
+      await sleep(5000);
+      await guard();
+      const row = await db.getSnapshotByGeneration(this.ctx.pool, problem.external_id, job.target_generation);
+      if (!row) throw new Error(`snapshot row disappeared for ${problem.external_id} generation ${job.target_generation}`);
+      state = String(row.state).toLowerCase();
     }
-    return snap;
+    if (state !== 'ready') {
+      const row = await db.getSnapshotByGeneration(this.ctx.pool, problem.external_id, job.target_generation);
+      throw new RustError(500, JSON.stringify({
+        error_code: row?.error_code ?? 'snapshot_failed',
+        message: row?.error_message ?? `snapshot state: ${state}`,
+      }));
+    }
+    await db.clearDirtyAfterSnapshotForJob(this.ctx.pool, job, problem.external_id, job.target_generation, dirtyVersion);
+    return { ...snap, state };
   }
 
   private async restore(job: JobT, guard: () => Promise<void>): Promise<unknown> {
@@ -276,6 +298,11 @@ export class JobWorker {
     throw new Error(`Incident command ${args.command} has no automated implementation in the TypeScript control plane`);
   }
 }
+
+// Multi-hundred-MB uploads must not be bounded by HTTP timeouts; 90 minutes
+// covers ~1GB at 1.5 Mbps with margin. The background upload continues and
+// records its own terminal state even if this deadline trips.
+const SNAPSHOT_WAIT_MS = 90 * 60 * 1000;
 
 function errorCode(err: unknown): string {
   if (err instanceof RustError && err.code) return err.code.toLowerCase();

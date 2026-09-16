@@ -591,12 +591,20 @@ pub async fn acquire_dirty_snapshot_job_by_code(
         row.external_id,
         chrono::Utc::now().timestamp_millis()
     );
-    sqlx::query(
+    // The one-active-job-per-problem guard can race with the control plane
+    // creating the same job; losing that race means someone else owns the
+    // snapshot, not an error.
+    let inserted = sqlx::query(
         r#"INSERT INTO jobs
              (id, idempotency_key, job_type, problem_id, target_generation, state,
               lease_owner, lease_expires_at, fencing_token, attempt, max_attempts)
            VALUES ($1, $2, 'snapshot', $3, $4, 'running',
-                   $5, now() + ($6::text || ' seconds')::interval, $7, 1, 3)"#,
+                   $5, now() + ($6::text || ' seconds')::interval, $7, 1, 3)
+           ON CONFLICT (problem_id, job_type)
+             WHERE problem_id IS NOT NULL
+               AND job_type IN ('scan', 'snapshot', 'restore', 'evict')
+               AND state IN ('pending', 'running')
+           DO NOTHING"#,
     )
     .bind(job_id)
     .bind(idem)
@@ -608,6 +616,9 @@ pub async fn acquire_dirty_snapshot_job_by_code(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    if inserted.rows_affected() == 0 {
+        return Ok(None);
+    }
     Ok(Some((
         job_id,
         row.external_id,

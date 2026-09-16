@@ -249,18 +249,48 @@ async fn create_snapshot(
 ) -> AppResult<Json<Snapshot>> {
     check_token(&headers, &s.internal_token)?;
     let scan = scanner::scan_problem_folder(s.problem_root.as_ref(), &req.code)?;
-    let mgr = SnapshotManager::new(s.db.clone(), s.store.clone())
-        .with_max_concurrent_uploads(s.max_concurrent_uploads);
-    let snap = mgr
-        .create_snapshot(
-            &req.problem_external_id,
-            req.generation,
-            req.fencing_token,
-            req.dirty_version,
-            s.problem_root.as_ref(),
-            &scan,
-        )
-        .await?;
+    let mgr = SnapshotManager::new(s.db.clone(), s.store.clone());
+    let (snap, run_upload) =
+        mgr.claim_snapshot(&req.problem_external_id, req.generation, req.fencing_token)
+            .await?;
+    if run_upload {
+        // Large problems upload for far longer than any sane HTTP timeout, so
+        // the upload runs in a spawned task and records its own terminal state
+        // in the database; the control plane polls the snapshot row instead of
+        // holding this request open. Dropping this request never cancels an
+        // in-flight upload.
+        let upload_mgr = SnapshotManager::new(s.db.clone(), s.store.clone())
+            .with_max_concurrent_uploads(s.max_concurrent_uploads);
+        let problem_id = req.problem_external_id.clone();
+        let generation = req.generation;
+        let fencing_token = req.fencing_token;
+        let dirty_version = req.dirty_version;
+        let problem_root = std::path::PathBuf::from(s.problem_root.as_ref());
+        let snapshot_id = snap.id;
+        let created_at = snap.created_at;
+        tokio::spawn(async move {
+            if let Err(err) = upload_mgr
+                .run_snapshot_upload(
+                    snapshot_id,
+                    &problem_id,
+                    generation,
+                    fencing_token,
+                    dirty_version,
+                    &problem_root,
+                    &scan,
+                    created_at,
+                )
+                .await
+            {
+                tracing::error!(
+                    problem_id = problem_id,
+                    generation,
+                    error = %err,
+                    "background snapshot upload failed"
+                );
+            }
+        });
+    }
     Ok(Json(snap))
 }
 

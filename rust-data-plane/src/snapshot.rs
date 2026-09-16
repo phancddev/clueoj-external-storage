@@ -59,6 +59,39 @@ pub fn should_clear_dirty_after_snapshot(
         && dirty_generation.is_some_and(|generation| generation <= snapshot_generation)
 }
 
+#[derive(sqlx::FromRow)]
+struct SnapshotRow {
+    id: uuid::Uuid,
+    problem_id: String,
+    generation: i64,
+    state: String,
+    file_count: i64,
+    total_bytes: i64,
+    manifest_key: Option<String>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<SnapshotRow> for crate::models::Snapshot {
+    fn from(row: SnapshotRow) -> Self {
+        Self {
+            id: row.id,
+            problem_id: row.problem_id,
+            generation: row.generation,
+            state: row.state,
+            file_count: row.file_count,
+            total_bytes: row.total_bytes.max(0) as u64,
+            manifest_key: row.manifest_key,
+            error_code: row.error_code,
+            error_message: row.error_message,
+            created_at: row.created_at,
+            completed_at: row.completed_at,
+        }
+    }
+}
+
 impl SnapshotManager {
     pub fn new(db: PgPool, store: Arc<dyn ObjectStore>) -> Self {
         Self {
@@ -73,15 +106,16 @@ impl SnapshotManager {
         self
     }
 
-    pub async fn create_snapshot(
+    /// Claim the snapshot row for (problem_id, generation) without running the
+    /// upload. Returns the current snapshot together with whether the caller
+    /// owns the upload: a fresh claim (or takeover of a stale/error row) must
+    /// run it, while an existing active-or-terminal row belongs to another run.
+    pub async fn claim_snapshot(
         &self,
         problem_id: &str,
         generation: i64,
         fencing_token: i64,
-        expected_dirty_version: Option<i64>,
-        problem_root: &Path,
-        scan: &ScanResult,
-    ) -> AppResult<Snapshot> {
+    ) -> AppResult<(Snapshot, bool)> {
         let requested_snapshot_id = uuid::Uuid::new_v4();
         let now = chrono::Utc::now();
 
@@ -114,9 +148,10 @@ impl SnapshotManager {
         .fetch_optional(&self.db)
         .await?;
         let Some((snapshot_id, created_at)) = snapshot_row else {
-            return Err(AppError::Internal(format!(
-                "snapshot generation {generation} already exists for problem {problem_id}"
-            )));
+            // Another run owns this generation (active and fresh, or already
+            // terminal). Surface the current row; the caller must not upload.
+            let existing = self.load_snapshot(problem_id, generation).await?;
+            return Ok((existing, false));
         };
         // Defensive cleanup for any future failure path that may have written
         // object identities before rolling the snapshot into the error state.
@@ -125,6 +160,56 @@ impl SnapshotManager {
             .execute(&self.db)
             .await?;
 
+        Ok((
+            Snapshot {
+                id: snapshot_id,
+                problem_id: problem_id.to_string(),
+                generation,
+                state: "discovered".to_string(),
+                file_count: 0,
+                total_bytes: 0,
+                manifest_key: None,
+                error_code: None,
+                error_message: None,
+                created_at,
+                completed_at: None,
+            },
+            true,
+        ))
+    }
+
+    async fn load_snapshot(&self, problem_id: &str, generation: i64) -> AppResult<Snapshot> {
+        let row = sqlx::query_as::<_, SnapshotRow>(
+            r#"SELECT id, problem_id, generation, state, file_count, total_bytes,
+                      manifest_key, error_code, error_message, created_at, completed_at
+               FROM snapshots WHERE problem_id = $1 AND generation = $2"#,
+        )
+        .bind(problem_id)
+        .bind(generation)
+        .fetch_optional(&self.db)
+        .await?;
+        row.map(Snapshot::from)
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "snapshot generation {generation} missing for problem {problem_id}"
+                ))
+            })
+    }
+
+    /// Run the upload for a claimed snapshot row. Errors are recorded on the
+    /// snapshot row itself so the outcome survives the caller being dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_snapshot_upload(
+        &self,
+        snapshot_id: uuid::Uuid,
+        problem_id: &str,
+        generation: i64,
+        fencing_token: i64,
+        expected_dirty_version: Option<i64>,
+        problem_root: &Path,
+        scan: &ScanResult,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> AppResult<()> {
         let result = self
             .create_snapshot_after_insert(
                 snapshot_id,
@@ -140,7 +225,7 @@ impl SnapshotManager {
         if let Err(e) = &result {
             self.mark_snapshot_error(snapshot_id, e).await?;
         }
-        result
+        result.map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
