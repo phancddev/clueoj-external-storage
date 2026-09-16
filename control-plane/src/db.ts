@@ -1088,6 +1088,19 @@ export async function createJob(
   return rowToJob(rows[0]);
 }
 
+export async function cancelPendingLocalJobsForRestore(pool: Pool, externalId: string): Promise<number> {
+  const { rowCount } = await pool.query(
+    `UPDATE jobs
+     SET state = 'cancelled', completed_at = now(),
+         error_code = 'superseded_by_restore', error_message = 'cancelled: local folder missing, restore takes over'
+     WHERE problem_id = $1
+       AND job_type IN ('scan', 'snapshot')
+       AND state = 'pending'`,
+    [externalId],
+  );
+  return rowCount ?? 0;
+}
+
 export async function createRestoreJobIfMissing(
   pool: Pool,
   opts: {
@@ -1145,6 +1158,20 @@ export async function createRestoreJobIfMissing(
       return { ready: false, job: rowToJob(active.rows[0]) };
     }
 
+    // A restore means the local folder is gone, so any pending scan/snapshot
+    // for this problem is dead weight (it would fail on the missing folder)
+    // and its uniqueness slot would block the restore job below. Cancel it
+    // inside the same transaction; the watcher re-schedules a snapshot after
+    // the restore completes and the folder is present again.
+    await client.query(
+      `UPDATE jobs
+       SET state = 'cancelled', completed_at = now(),
+           error_code = 'superseded_by_restore', error_message = 'cancelled: local folder missing, restore takes over'
+       WHERE problem_id = $1
+         AND job_type IN ('scan', 'snapshot')
+         AND state = 'pending'`,
+      [opts.problemId],
+    );
     const usage = await client.query(
       `SELECT local_status, observed_at
        FROM problem_usage

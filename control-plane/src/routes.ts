@@ -618,6 +618,7 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
           request_id: getRequestId(req),
         });
       }
+      await db.cancelPendingLocalJobsForRestore(ctx.pool, externalId);
       const job = await db.createJob(ctx.pool, {
         idempotencyKey, jobType: 'restore', problemId: externalId, targetGeneration: generation, leaseOwner: getAuth(req).sub,
         requestFingerprint: db.stableFingerprint({ action: 'restore', external_id: externalId, generation }),
