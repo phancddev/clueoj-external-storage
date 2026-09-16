@@ -103,6 +103,8 @@ impl SnapshotManager {
                    error_message = NULL,
                    completed_at = NULL
                WHERE snapshots.state = 'error'
+                  OR (snapshots.state IN ('uploading', 'hashing', 'discovered', 'verifying')
+                      AND snapshots.created_at < now() - interval '30 minutes')
                RETURNING snapshots.id, snapshots.created_at"#,
         )
         .bind(requested_snapshot_id)
