@@ -150,20 +150,15 @@ async fn problem_readiness(
     .bind(problem_external_id)
     .fetch_optional(&s.db)
     .await?;
-    // Judging readiness, not snapshot verification: a folder with a valid
-    // canonical archive is usable as-is when no READY snapshot exists to
-    // diverge from (the problem was never backed up or backups failed —
-    // nothing was evicted, so local data is the only truth). Only a folder
-    // that *differs* from an existing READY snapshot is a partial/mismatch.
-    let verified = matched_generation.is_some();
-    let local_only = matched_generation.is_none() && latest_generation.is_none();
+    // Judging readiness, not snapshot verification. The judge reads the local
+    // folder directly, so any folder that scans cleanly and carries a valid
+    // canonical archive is usable NOW — dirty flags and pending snapshots are
+    // background backup concerns that must never block grading. Only a folder
+    // that cannot be scanned (corrupt/locked) stays partial.
+    let usable = canonical.is_some();
     Ok(ProblemReadyResponse {
-        ready: verified || (local_only && canonical.is_some()),
-        local_status: if verified || (local_only && canonical.is_some()) {
-            "present".to_string()
-        } else {
-            "partial".to_string()
-        },
+        ready: usable,
+        local_status: if usable { "present".to_string() } else { "partial".to_string() },
         generation: matched_generation.or(latest_generation),
         observed_at: chrono::Utc::now(),
     })

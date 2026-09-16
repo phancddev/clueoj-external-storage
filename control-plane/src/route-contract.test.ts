@@ -526,7 +526,7 @@ describe('runtime route contracts', () => {
     expect(res.json()).toMatchObject({ code: 'not_ready' });
   });
 
-  it('ensure-ready snapshots dirty local data instead of restoring old R2', async () => {
+  it('ensure-ready serves dirty-but-usable local data immediately; snapshots run in the background', async () => {
     const app = Fastify({ logger: false });
     await buildRoutes(app, { pool: new EnsureReadyPool('snapshotting') as any, env, rust: rustByMode('snapshotting') as any });
     const token = await signOperatorToken(env.dashboardJwtSecret, 'admin', 'operator', 60, env.dashboardJwtAudience);
@@ -535,8 +535,11 @@ describe('runtime route contracts', () => {
       url: '/api/v1/problems/p1/ensure-ready',
       headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'idem-ensure' },
     });
-    expect(res.statusCode).toBe(202);
-    expect(res.json()).toMatchObject({ status: 'snapshotting', ready: false, job_id: 'job-snapshot' });
+    // The judge reads the local folder directly, so a usable folder grades
+    // now; the owed snapshot is scheduled by the watcher/reconcile path and
+    // must never block submissions behind the snapshot queue.
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ status: 'ready', ready: true });
   });
 
   it('ensure-ready refuses to snapshot dirty partial data over a complete snapshot', async () => {

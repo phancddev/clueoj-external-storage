@@ -507,27 +507,12 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
     } catch (err) {
       return reply.code(502).send({ code: 'ready_check_failed', message: (err as Error).message, retryable: true, request_id: getRequestId(req) });
     }
-    if (actual.ready && actual.local_status === 'present' && !problem.dirty) {
+    if (actual.ready && actual.local_status === 'present') {
+      // The judge reads the local folder directly; a usable folder serves
+      // submissions immediately. A dirty flag only means a background
+      // snapshot is owed (the watcher/reconcile path schedules it) and must
+      // never block grading behind the snapshot queue.
       return reply.send({ status: 'ready', ready: true });
-    }
-    if (actual.local_status === 'present' && problem.dirty) {
-      const generation = problem.dirty_generation ?? await db.allocateGeneration(ctx.pool, externalId);
-      try {
-        const job = await db.createJob(ctx.pool, {
-          idempotencyKey: key,
-          jobType: 'snapshot',
-          problemId: externalId,
-          targetGeneration: generation,
-          leaseOwner: getAuth(req).sub,
-          requestFingerprint: db.stableFingerprint({ action: 'ensure-ready-snapshot', external_id: externalId, generation, dirty_version: problem.dirty_version }),
-        });
-        if (rejectTerminalEnsureJob(reply, job, getRequestId(req))) return;
-        await db.setJobPayload(ctx.pool, job.id, { dirty_version: problem.dirty_version });
-        await audit(ctx, req, 'problem.ensure_ready_snapshot', { problemId: externalId, generation, jobId: job.id });
-        return reply.code(202).send({ status: 'snapshotting', ready: false, ...accepted(job) });
-      } catch (err) {
-        return sendJobError(reply, err, getRequestId(req));
-      }
     }
     if (actual.local_status !== 'missing') {
       return reply.code(409).send({
