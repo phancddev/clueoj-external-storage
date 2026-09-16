@@ -545,6 +545,46 @@ pub async fn acquire_dirty_snapshot_job_by_code(
         .execute(&mut *tx)
         .await?;
 
+    // The control plane may already hold a PENDING snapshot job for this dirty
+    // problem (queued by the OJ dirty-notification path behind a long queue).
+    // Claim that job instead of inserting a duplicate — the one-active-job
+    // unique constraint would reject the insert and leave the fresh test data
+    // stuck behind the queue even though the watcher could snapshot it now.
+    let claimed = sqlx::query_as::<_, (uuid::Uuid, Option<i64>, i64)>(
+        r#"WITH token AS (
+             INSERT INTO job_fencing_counters (problem_id, next_token)
+             VALUES ($1, 2)
+             ON CONFLICT (problem_id) DO UPDATE
+               SET next_token = job_fencing_counters.next_token + 1
+             RETURNING next_token - 1 AS fencing_token
+           )
+           UPDATE jobs j
+           SET state = 'running',
+               lease_owner = $2,
+               lease_expires_at = now() + ($3::text || ' seconds')::interval,
+               fencing_token = (SELECT fencing_token FROM token),
+               attempt = j.attempt + 1,
+               error_code = NULL,
+               error_message = NULL
+           WHERE j.problem_id = $1 AND j.job_type = 'snapshot' AND j.state = 'pending'
+           RETURNING j.id, j.target_generation, (SELECT fencing_token FROM token)"#,
+    )
+    .bind(&row.external_id)
+    .bind(lease_owner)
+    .bind(lease_seconds)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((job_id, generation, token)) = claimed {
+        tx.commit().await?;
+        return Ok(Some((
+            job_id,
+            row.external_id,
+            generation.unwrap_or(row.generation),
+            token,
+            row.dirty_version,
+        )));
+    }
+
     let job_id = uuid::Uuid::new_v4();
     let idem = format!(
         "rust-dirty:{}:{}",
