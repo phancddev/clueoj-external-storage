@@ -41,6 +41,10 @@ pub async fn run_full_reconcile_once(root: &Path, db: &PgPool) -> AppResult<Reco
     let folders = scanner::list_problem_codes(root)?;
     let catalog = db::list_catalog_problems(db).await?;
     let plan = build_reconcile_plan(&folders, &catalog);
+    let healed = db::heal_usage_ready_projection(db).await?;
+    if healed > 0 {
+        tracing::info!(healed, "healed stale r2 ready projections");
+    }
     apply_reconcile_plan(root, db, plan).await
 }
 

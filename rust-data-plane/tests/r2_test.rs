@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use rust_data_plane::error::AppError;
 use rust_data_plane::models::{Manifest, ManifestFile};
 use rust_data_plane::r2::InMemoryStore;
@@ -375,4 +377,116 @@ async fn test_restore_rejects_missing_hardlink_source() {
     let result = materialize_manifest_files(&store, &manifest, dir.path()).await;
 
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_heal_usage_ready_projection_flips_unbacked_to_ready() {
+    let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
+        return;
+    };
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("connect test postgres");
+    let schema = format!("rust_heal_{}", uuid::Uuid::new_v4().simple());
+    sqlx::Executor::execute(
+        &admin,
+        sqlx::raw_sql(format!(r#"CREATE SCHEMA "{schema}""#).as_str()),
+    )
+    .await
+    .expect("create test schema");
+    let options = sqlx::postgres::PgConnectOptions::from_str(&database_url)
+        .expect("parse test postgres URL")
+        .options([("search_path", format!("{schema},public"))]);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .expect("connect isolated test schema");
+    for migration in [
+        include_str!("../../migrations/001_init.sql"),
+        include_str!("../../migrations/002_phase6.sql"),
+        include_str!("../../migrations/003_review_contracts.sql"),
+        include_str!("../../migrations/004_idempotency_dirty_contract.sql"),
+        include_str!("../../migrations/005_dashboard_users.sql"),
+        include_str!("../../migrations/006_problem_identity_rekey.sql"),
+        include_str!("../../migrations/007_active_job_guards.sql"),
+        include_str!("../../migrations/008_snapshot_retention_gc.sql"),
+        include_str!("../../migrations/009_passive_local_eviction.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(&pool).await.expect("apply migration");
+    }
+
+    sqlx::query(
+        r#"INSERT INTO problems (external_id, code, catalog_state, dirty)
+           VALUES ('p-heal', 'sum', 'present', false)"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("insert problem");
+    // Wedged state: READY snapshot exists but the usage projection was never
+    // flipped (crash between the two completion writes).
+    sqlx::query(
+        r#"INSERT INTO problem_usage (problem_id, local_status, r2_status, stale)
+           VALUES ('p-heal', 'present', 'none', true)"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("insert usage");
+    sqlx::query(
+        r#"INSERT INTO snapshots (problem_id, generation, state, file_count, total_bytes)
+           VALUES ('p-heal', 3, 'ready', 1, 10)"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("insert ready snapshot");
+    // Control: already-ready projection at a newer generation must not regress.
+    sqlx::query(
+        r#"INSERT INTO problems (external_id, code, catalog_state, dirty)
+           VALUES ('p-ok', 'avg', 'present', false)"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("insert control problem");
+    sqlx::query(
+        r#"INSERT INTO problem_usage (problem_id, local_status, r2_status, snapshot_generation, stale)
+           VALUES ('p-ok', 'present', 'ready', 5, false)"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("insert control usage");
+    sqlx::query(
+        r#"INSERT INTO snapshots (problem_id, generation, state, file_count, total_bytes)
+           VALUES ('p-ok', 3, 'ready', 1, 10)"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("insert control snapshot");
+
+    let healed = rust_data_plane::db::heal_usage_ready_projection(&pool)
+        .await
+        .expect("heal projection");
+    assert_eq!(healed, 1);
+
+    let healed_row = sqlx::query_as::<_, (String, Option<i32>, bool)>(
+        r#"SELECT r2_status, snapshot_generation, stale FROM problem_usage
+           WHERE problem_id = 'p-heal'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("fetch healed usage");
+    assert_eq!(healed_row.0, "ready");
+    assert_eq!(healed_row.1, Some(3));
+    assert!(!healed_row.2);
+
+    let control_row = sqlx::query_as::<_, (String, Option<i32>)>(
+        r#"SELECT r2_status, snapshot_generation FROM problem_usage
+           WHERE problem_id = 'p-ok'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("fetch control usage");
+    assert_eq!(control_row.0, "ready");
+    assert_eq!(control_row.1, Some(5));
 }

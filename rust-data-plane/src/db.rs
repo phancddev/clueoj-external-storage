@@ -333,6 +333,38 @@ pub async fn mark_local_missing_by_code(pool: &PgPool, code: &str) -> AppResult<
     Ok(())
 }
 
+/// Heal `problem_usage.r2_status` rows that were never flipped to `ready`.
+///
+/// The snapshot completion path writes `snapshots.state = 'ready'` and the
+/// usage projection in two steps; a crash or reaper kill between them leaves
+/// the problem looking unbacked ("none") forever while a READY snapshot
+/// actually exists in R2. Nothing else re-flips the projection, and the
+/// control-plane reconcile refuses to reschedule such problems (a READY
+/// snapshot already exists), so they pile up in the "no R2 backup" listing.
+/// The generation guard keeps live uploads untouched: we only advance the
+/// projection to a READY generation newer than what it already points at.
+pub async fn heal_usage_ready_projection(pool: &PgPool) -> AppResult<u64> {
+    let result = sqlx::query(
+        r#"UPDATE problem_usage pu
+           SET r2_status = 'ready',
+               snapshot_generation = s.generation,
+               observed_at = now(),
+               stale = false
+           FROM (
+             SELECT DISTINCT ON (problem_id) problem_id, generation
+             FROM snapshots
+             WHERE state = 'ready'
+             ORDER BY problem_id, generation DESC
+           ) s
+           WHERE pu.problem_id = s.problem_id
+             AND (pu.snapshot_generation IS NULL OR pu.snapshot_generation < s.generation)
+             AND pu.r2_status <> 'ready'"#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn mark_local_verified(
     pool: &PgPool,
     problem_id: &str,
