@@ -15,9 +15,10 @@ function dependencies(eligible: boolean) {
     createJob: vi.fn().mockResolvedValue(job),
     setJobPayload: vi.fn().mockResolvedValue(job),
     stableFingerprint: vi.fn().mockReturnValue('fingerprint'),
+    scheduleDirtySnapshotBatch: vi.fn().mockResolvedValue([]),
   } satisfies Pick<
     typeof DbModule,
-    'applyRetention' | 'listGcEligible' | 'createJob' | 'setJobPayload' | 'stableFingerprint'
+    'applyRetention' | 'listGcEligible' | 'createJob' | 'setJobPayload' | 'stableFingerprint' | 'scheduleDirtySnapshotBatch'
   >;
 }
 
@@ -46,5 +47,25 @@ describe('maintenance scheduler', () => {
       leaseOwner: 'system',
     }));
     expect(deps.setJobPayload).toHaveBeenCalledWith(expect.anything(), 'gc-job', { limit: 500 });
+  });
+
+  it('reschedules dirty problem backups each reschedule tick', async () => {
+    const deps = dependencies(false);
+    deps.scheduleDirtySnapshotBatch = vi.fn().mockResolvedValue([
+      { problem_id: 'p1', scan_job_id: 's1', snapshot_job_id: 'n1' },
+    ]);
+    const scheduler = new MaintenanceScheduler({} as Pool, deps);
+
+    await scheduler.runRescheduleOnce();
+
+    expect(deps.scheduleDirtySnapshotBatch).toHaveBeenCalledWith(expect.anything(), 'maintenance-reschedule', 200);
+  });
+
+  it('keeps the reschedule loop alive when the batch scheduler errors', async () => {
+    const deps = dependencies(false);
+    deps.scheduleDirtySnapshotBatch = vi.fn().mockRejectedValue(new Error('db down'));
+    const scheduler = new MaintenanceScheduler({} as Pool, deps);
+
+    await expect(scheduler.runRescheduleOnce()).resolves.toBeUndefined();
   });
 });

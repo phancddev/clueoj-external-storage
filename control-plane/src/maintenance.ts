@@ -3,16 +3,20 @@ import * as db from './db.js';
 import { logger } from './logger.js';
 
 const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
+const RESCHEDULE_INTERVAL_MS = 60 * 1000;
 const GC_BATCH_SIZE = 500;
+const RESCHEDULE_BATCH_SIZE = 200;
 type MaintenanceDb = Pick<
   typeof db,
-  'applyRetention' | 'listGcEligible' | 'createJob' | 'setJobPayload' | 'stableFingerprint'
+  'applyRetention' | 'listGcEligible' | 'createJob' | 'setJobPayload' | 'stableFingerprint' | 'scheduleDirtySnapshotBatch'
 >;
 
 export class MaintenanceScheduler {
   private stopped = false;
   private timer: NodeJS.Timeout | null = null;
+  private rescheduleTimer: NodeJS.Timeout | null = null;
   private running: Promise<void> | null = null;
+  private rescheduling: Promise<void> | null = null;
 
   constructor(
     private pool: Pool,
@@ -22,6 +26,7 @@ export class MaintenanceScheduler {
   start(): void {
     if (this.running || this.timer) return;
     this.schedule(0);
+    this.scheduleReschedule(RESCHEDULE_INTERVAL_MS);
   }
 
   async stop(): Promise<void> {
@@ -30,7 +35,12 @@ export class MaintenanceScheduler {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    if (this.rescheduleTimer) {
+      clearTimeout(this.rescheduleTimer);
+      this.rescheduleTimer = null;
+    }
     await this.running;
+    await this.rescheduling;
   }
 
   private schedule(delayMs: number): void {
@@ -43,6 +53,35 @@ export class MaintenanceScheduler {
       });
     }, delayMs);
     this.timer.unref();
+  }
+
+  // A dirty notification that races an active scan/snapshot is skipped by the
+  // active-job guard and nothing retries the scheduling: the problem stays
+  // dirty forever with no jobs. Re-run the batch scheduler every minute so the
+  // round-keyed jobs appear once the conflicting operation finishes.
+  private scheduleReschedule(delayMs: number): void {
+    if (this.stopped) return;
+    this.rescheduleTimer = setTimeout(() => {
+      this.rescheduleTimer = null;
+      this.rescheduling = this.runRescheduleOnce().finally(() => {
+        this.rescheduling = null;
+        if (!this.stopped) this.scheduleReschedule(RESCHEDULE_INTERVAL_MS);
+      });
+    }, delayMs);
+    this.rescheduleTimer.unref();
+  }
+
+  async runRescheduleOnce(): Promise<void> {
+    try {
+      const scheduled = await this.maintenanceDb.scheduleDirtySnapshotBatch(
+        this.pool, 'maintenance-reschedule', RESCHEDULE_BATCH_SIZE,
+      );
+      if (scheduled.length > 0) {
+        logger.info({ scheduled: scheduled.length }, 'rescheduled dirty problem backups');
+      }
+    } catch (err) {
+      logger.error({ err }, 'dirty backup reschedule failed');
+    }
   }
 
   async runOnce(): Promise<void> {
