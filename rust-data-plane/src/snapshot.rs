@@ -904,6 +904,23 @@ impl SnapshotManager {
         presign_canonical_from_manifest(self.store.as_ref(), &manifest, ttl, filename_override.as_deref()).await
     }
 
+    /// Presign a single file (checker/grader/init.yml/...) of the latest
+    /// READY snapshot for direct download while the local folder is evicted.
+    pub async fn presign_download_path(
+        &self,
+        problem_id: &str,
+        rel_path: &str,
+        ttl: Option<std::time::Duration>,
+    ) -> AppResult<PresignResult> {
+        let gen = self.resolve_ready_generation(problem_id, 0).await?;
+        let mkey = manifest_key(problem_id, gen);
+        let manifest_bytes = self.store.get_object(&mkey).await?;
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| AppError::Internal(format!("manifest parse: {e}")))?;
+        validate_manifest(&manifest, problem_id, gen)?;
+        presign_file_from_manifest(self.store.as_ref(), &manifest, rel_path, ttl).await
+    }
+
     async fn problem_code(&self, problem_id: &str) -> AppResult<Option<String>> {
         let mut conn = self.db.acquire().await?;
         let code = sqlx::query_scalar::<_, String>(
@@ -1154,6 +1171,44 @@ pub async fn presign_canonical_from_manifest(
 
     store.presign_get(&archive.object_key, filename, ttl).await
 }
+
+/// Presign any single file from a validated manifest (checker, grader,
+/// init.yml, ...) so the OJ can serve it straight from R2 after the local
+/// copy was evicted. Mirrors the canonical path's integrity checks.
+pub async fn presign_file_from_manifest(
+    store: &dyn ObjectStore,
+    manifest: &Manifest,
+    rel_path: &str,
+    ttl: Option<std::time::Duration>,
+) -> AppResult<PresignResult> {
+    paths::validate_relative_path(rel_path)?;
+    let file = manifest
+        .files
+        .iter()
+        .find(|f| f.path == rel_path)
+ .ok_or_else(|| AppError::ObjectNotFound(format!("manifest file {rel_path}")))?;
+    let filename = std::path::Path::new(&file.path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_string());
+
+    let meta = store.head_object(&file.object_key).await?;
+    if !meta.exists || meta.size != file.size {
+        return Err(AppError::R2NotReady(manifest.problem_id.clone()));
+    }
+    match meta.sha256.as_deref() {
+        Some(sha) if sha == file.sha256 => {}
+        Some(sha) => {
+            return Err(AppError::ChecksumMismatch {
+                expected: file.sha256.clone(),
+                got: sha.to_string(),
+            });
+        }
+        None => return Err(AppError::R2NotReady(manifest.problem_id.clone())),
+    }
+    store.presign_get(&file.object_key, &filename, ttl).await
+}
+
 async fn upload_manifest_file(
     db: PgPool,
     snapshot_id: uuid::Uuid,

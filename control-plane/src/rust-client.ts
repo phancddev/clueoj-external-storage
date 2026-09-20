@@ -182,8 +182,8 @@ export class RustClient {
     return this.post('/internal/objects:delete', { object_key: objectKey, fencing_token: fencingToken });
   }
 
-  async presign(problemExternalId: string, ttlSeconds?: number): Promise<RustPresignResult> {
-    return this.post('/internal/presign', { problem_external_id: problemExternalId, ttl_seconds: ttlSeconds });
+  async presign(problemExternalId: string, ttlSeconds?: number, path?: string): Promise<RustPresignResult> {
+    return this.post('/internal/presign', { problem_external_id: problemExternalId, ttl_seconds: ttlSeconds, path });
   }
 
   async getProblemUsage(code: string): Promise<unknown> {

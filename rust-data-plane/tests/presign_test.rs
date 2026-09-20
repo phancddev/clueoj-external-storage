@@ -184,3 +184,74 @@ async fn presign_prefers_problem_code_filename() {
     assert_eq!(store.presign_calls.load(Ordering::SeqCst), 1);
     assert!(result.url.contains("filename=004d.zip"));
 }
+
+fn multi_file_manifest() -> Manifest {
+    let mut m = manifest();
+    m.files.push(ManifestFile {
+        path: "checker.cpp".to_string(),
+        sha256: "c0de".to_string(),
+        size: 9,
+        allocated_bytes: 9,
+        mode: 0o644,
+        dev: 0,
+        ino: 0,
+        nlink: 1,
+        duplicate_of: None,
+        symlink_target: None,
+        object_key: "objects/sha256/c0/c0de".to_string(),
+    });
+    m
+}
+
+#[tokio::test]
+async fn presign_path_targets_requested_manifest_file() {
+    let store = InstrumentedStore::new(ObjectMeta {
+        size: 9,
+        etag: None,
+        sha256: Some("c0de".to_string()),
+        exists: true,
+    });
+    let result =
+        rust_data_plane::snapshot::presign_file_from_manifest(&store, &multi_file_manifest(), "checker.cpp", None)
+            .await
+            .unwrap();
+
+    assert_eq!(store.presign_calls.load(Ordering::SeqCst), 1);
+    assert!(result.url.contains("objects/sha256/c0/c0de"));
+    assert!(result.url.contains("filename=checker.cpp"));
+}
+
+#[tokio::test]
+async fn presign_path_rejects_unknown_file() {
+    let store = InstrumentedStore::new(ObjectMeta {
+        size: 9,
+        etag: None,
+        sha256: Some("c0de".to_string()),
+        exists: true,
+    });
+    let result =
+        rust_data_plane::snapshot::presign_file_from_manifest(&store, &multi_file_manifest(), "nope.cpp", None).await;
+
+    assert!(matches!(result, Err(AppError::ObjectNotFound(_))));
+    assert_eq!(store.presign_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn presign_path_rejects_traversal_path() {
+    let store = InstrumentedStore::new(ObjectMeta {
+        size: 9,
+        etag: None,
+        sha256: Some("c0de".to_string()),
+        exists: true,
+    });
+    let result = rust_data_plane::snapshot::presign_file_from_manifest(
+        &store,
+        &multi_file_manifest(),
+        "../checker.cpp",
+        None,
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(store.presign_calls.load(Ordering::SeqCst), 0);
+}

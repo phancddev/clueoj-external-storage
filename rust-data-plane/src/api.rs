@@ -386,6 +386,9 @@ async fn get_problem_usage(
 struct PresignReq {
     problem_external_id: String,
     ttl_seconds: Option<u64>,
+    /// Optional relative file path (checker/grader/init.yml/...). When set,
+    /// presign that manifest file instead of the canonical archive.
+    path: Option<String>,
 }
 
 async fn presign_download(
@@ -396,7 +399,10 @@ async fn presign_download(
     check_token(&headers, &s.internal_token)?;
     let ttl = req.ttl_seconds.map(Duration::from_secs);
     let mgr = SnapshotManager::new(s.db.clone(), s.store.clone());
-    let result = mgr.presign_download(&req.problem_external_id, ttl).await?;
+    let result = match req.path.as_deref() {
+        None | Some("") => mgr.presign_download(&req.problem_external_id, ttl).await?,
+        Some(path) => mgr.presign_download_path(&req.problem_external_id, path, ttl).await?,
+    };
     Ok(Json(result))
 }
 

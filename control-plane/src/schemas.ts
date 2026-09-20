@@ -238,6 +238,9 @@ export type DownloadResponseT = Static<typeof DownloadResponse>;
 export const DownloadRequest = Type.Object({
   problem_external_id: Type.String(),
   ttl_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })),
+  // Optional relative file path (checker/grader/init.yml/...) to presign a
+  // single manifest file instead of the canonical archive.
+  path: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
 });
 export type DownloadRequestT = Static<typeof DownloadRequest>;
 

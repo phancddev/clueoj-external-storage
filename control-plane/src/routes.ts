@@ -916,22 +916,22 @@ export async function buildRoutes(app: FastifyInstance, ctx: AppContext): Promis
   // ======================================================================
   app.post('/api/v1/downloads', { schema: { body: DownloadRequest, response: { 200: DownloadResponse, default: ErrorResponse } } }, async (req, reply) => {
     if (!requireScopes(req, reply, 'downloads:issue')) return;
-    const body = req.body as { problem_external_id: string; ttl_seconds?: number };
+    const body = req.body as { problem_external_id: string; ttl_seconds?: number; path?: string };
     if (!body?.problem_external_id) {
       return reply.code(400).send({ code: 'bad_request', message: 'problem_external_id required', retryable: false, request_id: getRequestId(req) });
     }
     const ttl = Math.min(body.ttl_seconds ?? ctx.env.presignTtlSeconds, 300);
     try {
-      const result = await ctx.rust.presign(body.problem_external_id, ttl);
+      const result = await ctx.rust.presign(body.problem_external_id, ttl, body.path);
       await audit(ctx, req, 'download.url_issued', {
         problemId: body.problem_external_id,
-        metadata: { ttl_seconds: ttl, expires_at: result.expires_at },
+        metadata: { ttl_seconds: ttl, expires_at: result.expires_at, path: body.path ?? null },
       });
       reply.send({ method: 'GET', ...result });
     } catch (err) {
       await audit(ctx, req, 'download.url_failed', {
         problemId: body.problem_external_id,
-        metadata: { error: (err as Error).message },
+        metadata: { error: (err as Error).message, path: body.path ?? null },
       }).catch(() => {});
       reply.code(502).send({ code: 'presign_failed', message: (err as Error).message, retryable: true, request_id: getRequestId(req) });
     }
