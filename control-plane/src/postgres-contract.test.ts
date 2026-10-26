@@ -30,6 +30,7 @@ describe.runIf(enabled)('PostgreSQL concurrency contracts', () => {
       '007_active_job_guards.sql',
       '008_snapshot_retention_gc.sql',
       '009_passive_local_eviction.sql',
+      '010_snapshot_backoff_job_retention.sql',
     ]) {
       if (name === '008_snapshot_retention_gc.sql') {
         await pool.query(
@@ -535,4 +536,123 @@ describe.runIf(enabled)('PostgreSQL concurrency contracts', () => {
     expect(expiredMark.rows[0].snapshot_id).toBe(protectedId);
     expect(expiredMark.rows[0].has_safety_window).toBe(true);
   });
+
+  async function snapshotFixture() {
+    const id = `backoff-${randomUUID()}`;
+    await pool.query(
+      `INSERT INTO problems (external_id, code, catalog_state, dirty, dirty_version)
+       VALUES ($1, $1, 'present', true, 1)`, [id],
+    );
+    await pool.query(`INSERT INTO problem_usage (problem_id, local_status) VALUES ($1, 'present')`, [id]);
+    return id;
+  }
+
+  async function snapshotOutcome(id: string, error: string | null, version = 1) {
+    const inserted = await pool.query(
+      `INSERT INTO jobs (idempotency_key, job_type, problem_id, state, result,
+                         lease_owner, lease_expires_at, fencing_token)
+       VALUES ($1, 'snapshot', $2, 'running', $3, 'test', now() + interval '1 hour', 1)
+       RETURNING id`, [randomUUID(), id, JSON.stringify({ dirty_version: version })],
+    );
+    const job = await db.getJob(pool, inserted.rows[0].id);
+    expect(job).not.toBeNull();
+    await db.completeJobWithLease(pool, job!, error ? 'failed' : 'completed', {}, error, error);
+    return inserted.rows[0].id as string;
+  }
+
+  async function failureCount(id: string) {
+    const result = await pool.query(
+      `SELECT snapshot_failure_count, last_snapshot_failed_at FROM problem_usage WHERE problem_id = $1`, [id],
+    );
+    return result.rows[0];
+  }
+
+  it('parks after three permanent failures and retries once after each backoff window', async () => {
+    const id = await snapshotFixture();
+    await snapshotOutcome(id, 'manifest_integrity');
+    await snapshotOutcome(id, 'MANIFEST_INTEGRITY');
+    await snapshotOutcome(id, 'PROBLEM_FOLDER_MISSING');
+    expect((await failureCount(id)).snapshot_failure_count).toBe(3);
+    expect(await db.scheduleAutoSnapshotJobs(pool, (await db.getProblem(pool, id))!, 'catalog-reconcile')).toBeNull();
+    expect((await db.scheduleDirtySnapshotBatch(pool, 'test', 500)).some(j => j.problem_id === id)).toBe(false);
+
+    // Even without dirty=true, the original no-ready-snapshot path survives.
+    await pool.query(`UPDATE problems SET dirty = false WHERE external_id = $1`, [id]);
+    await pool.query(
+      `UPDATE problem_usage SET last_snapshot_failed_at = now() - interval '25 hours' WHERE problem_id = $1`, [id],
+    );
+    const scheduled = (await db.scheduleDirtySnapshotBatch(pool, 'test', 500)).find(j => j.problem_id === id);
+    expect(scheduled).toBeDefined();
+    await pool.query(`UPDATE jobs SET state = 'completed' WHERE id = $1`, [scheduled!.scan_job_id]);
+    await pool.query(
+      `UPDATE jobs SET state = 'failed', error_code = 'manifest_integrity' WHERE id = $1`, [scheduled!.snapshot_job_id],
+    );
+    expect((await failureCount(id)).snapshot_failure_count).toBe(4);
+    expect((await db.scheduleDirtySnapshotBatch(pool, 'test', 500)).some(j => j.problem_id === id)).toBe(false);
+  });
+
+  it('transient failures do not park and successful snapshots clear the counter', async () => {
+    const id = await snapshotFixture();
+    for (const error of ['r2_error', 'job_failed', 'dispatch_failed', 'lease_expired']) {
+      await snapshotOutcome(id, error);
+    }
+    expect(await failureCount(id)).toEqual({ snapshot_failure_count: 0, last_snapshot_failed_at: null });
+    await snapshotOutcome(id, 'manifest_integrity');
+    await snapshotOutcome(id, null);
+    expect(await failureCount(id)).toEqual({ snapshot_failure_count: 0, last_snapshot_failed_at: null });
+    expect((await db.scheduleDirtySnapshotBatch(pool, 'test', 500)).some(j => j.problem_id === id)).toBe(true);
+  });
+
+  it('dirty notification unparks immediately and stale completion cannot re-park it', async () => {
+    const id = await snapshotFixture();
+    for (let i = 0; i < 3; i++) await snapshotOutcome(id, 'manifest_integrity');
+    const notified = await db.markProblemDirtyIdempotent(pool, randomUUID(), 'test', {
+      externalId: id, code: id, ownerOrganization: null, isManuallyManaged: false,
+      mirrorOf: null, mirrorRoot: null, quotaBytes: null, schemaVersion: 1,
+    });
+    expect(await failureCount(id)).toEqual({ snapshot_failure_count: 0, last_snapshot_failed_at: null });
+    await snapshotOutcome(id, 'manifest_integrity', 1);
+    expect((await failureCount(id)).snapshot_failure_count).toBe(0);
+    expect(await db.scheduleAutoSnapshotJobs(pool, notified.problem, 'test')).not.toBeNull();
+  });
+
+  it('purges old terminal jobs in batches and keeps recent and in-flight jobs', async () => {
+    const ids: string[] = [];
+    for (const state of ['completed', 'failed', 'cancelled', 'pending', 'running']) {
+      const result = await pool.query(
+        `INSERT INTO jobs (idempotency_key, job_type, state, updated_at)
+         VALUES ($1, 'retention-test', $2, now() - interval '15 days') RETURNING id`,
+        [randomUUID(), state],
+      );
+      ids.push(result.rows[0].id);
+    }
+    const recent = await pool.query(
+      `INSERT INTO jobs (idempotency_key, job_type, state)
+       VALUES ($1, 'retention-test', 'failed') RETURNING id`, [randomUUID()],
+    );
+    const dirtyKeysBefore = await pool.query(`SELECT count(*) FROM idempotency_keys`);
+    expect(await db.purgeTerminalJobs(pool, 2)).toBeGreaterThanOrEqual(3);
+    const remaining = await pool.query(`SELECT id FROM jobs WHERE id = ANY($1::uuid[])`, [ids]);
+    expect(remaining.rows.map(r => r.id).sort()).toEqual(ids.slice(3).sort());
+    expect(await db.getJob(pool, recent.rows[0].id)).not.toBeNull();
+    expect((await pool.query(`SELECT count(*) FROM idempotency_keys`)).rows).toEqual(dirtyKeysBefore.rows);
+  });
+
+
+  it('keeps retry identities advancing when terminal job history is removed', async () => {
+    const id = await snapshotFixture();
+    const problem = (await db.getProblem(pool, id))!;
+    const first = (await db.scheduleAutoSnapshotJobs(pool, problem, 'test'))!;
+    const before = (await db.getJob(pool, first.snapshot_job_id))!;
+    await pool.query(`UPDATE jobs SET state = 'completed' WHERE id = $1`, [first.scan_job_id]);
+    await pool.query(`UPDATE jobs SET state = 'failed', error_code = 'r2_error' WHERE id = $1`, [first.snapshot_job_id]);
+    // Rewriting an already terminal row must not advance the round again.
+    await pool.query(`UPDATE jobs SET state = 'failed' WHERE id = $1`, [first.snapshot_job_id]);
+    const round = await pool.query(`SELECT snapshot_schedule_round FROM problem_usage WHERE problem_id = $1`, [id]);
+    expect(round.rows[0].snapshot_schedule_round).toBe('1');
+    await pool.query(`DELETE FROM jobs WHERE id = ANY($1::uuid[])`, [[first.scan_job_id, first.snapshot_job_id]]);
+    const second = (await db.scheduleAutoSnapshotJobs(pool, problem, 'test'))!;
+    expect((await db.getJob(pool, second.snapshot_job_id))!.idempotency_key).not.toBe(before.idempotency_key);
+  });
+
 });

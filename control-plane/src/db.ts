@@ -1,3 +1,4 @@
+import { maintenanceConfig, TERMINAL_JOB_DELETE_BATCH_SIZE } from './maintenance-config.js';
 import type { Pool, PoolClient } from 'pg';
 import type {
   ProblemT, ProblemUsageT, OrganizationUsageT, SnapshotT, JobT, AuditEventT, OrphanT, SyncChangeT,
@@ -207,13 +208,16 @@ export async function clearDirtyForMissingLocal(pool: Pool): Promise<number> {
 
 export async function markProblemDirty(pool: Pool, externalId: string): Promise<ProblemT | null> {
   const { rows } = await pool.query(
-    `UPDATE problems SET dirty = true, stale = true, observed_at = now()
+    `UPDATE problems SET dirty = true, dirty_version = dirty_version + 1,
+       stale = true, observed_at = now()
      WHERE external_id = $1 RETURNING *`,
     [externalId],
   );
   return rows[0] ? rowToProblem(rows[0]) : null;
 }
 
+// Recovery without a ready snapshot is not a new content edit: preserve the
+// dirty version and backoff count so an expired parked problem gets one retry.
 export async function markDirtyIfNoReady(pool: Pool, externalId: string): Promise<ProblemT | null> {
   const client = await pool.connect();
   try {
@@ -221,7 +225,6 @@ export async function markDirtyIfNoReady(pool: Pool, externalId: string): Promis
     const { rows } = await client.query(
       `UPDATE problems p
        SET dirty = true,
-           dirty_version = p.dirty_version + 1,
            dirty_generation = NULL,
            stale = true,
            observed_at = now()
@@ -256,18 +259,21 @@ export async function markDirtyIfNoReady(pool: Pool, externalId: string): Promis
 
 export async function scheduleAutoSnapshotJobs(pool: Pool, problem: ProblemT, actor: string): Promise<{ scan_job_id: string; snapshot_job_id: string } | null> {
   if (!problem.dirty) return null;
-  const generation = problem.dirty_generation ?? await allocateGeneration(pool, problem.external_id);
+  const config = maintenanceConfig();
   const dirtyVersion = problem.dirty_version;
-  // createJob replays an existing idempotency key verbatim, so a failed
-  // earlier attempt would otherwise be "scheduled" forever without ever
-  // running again. Scope the key by how many attempts already finished so
-  // each reschedule round enqueues a fresh job pair.
+  // The durable round survives retention and stays stable while work is active.
+  // The v2 namespace cannot collide with historical count-based keys.
   const { rows } = await pool.query(
-    `SELECT count(*)::int AS finished FROM jobs
-     WHERE problem_id = $1 AND job_type = 'snapshot' AND state IN ('failed', 'cancelled', 'completed')`,
-    [problem.external_id],
+    `SELECT snapshot_schedule_round::text AS round,
+       (snapshot_failure_count >= $2 AND last_snapshot_failed_at >
+         now() - ($3::double precision * interval '1 millisecond')) AS parked
+     FROM problem_usage WHERE problem_id = $1`,
+    [problem.external_id, config.permanentFailureThreshold, config.snapshotBackoffIntervalMs],
   );
-  const round = (rows[0]?.finished ?? 0) + 1;
+  // Catalog reconciliation also calls this helper directly.
+  if (rows[0]?.parked === true) return null;
+  const generation = problem.dirty_generation ?? await allocateGeneration(pool, problem.external_id);
+  const round = `v2-${rows[0]?.round ?? '0'}`;
   const scan = await createJob(pool, {
     idempotencyKey: `auto-scan:${problem.external_id}:${dirtyVersion}:${round}`,
     jobType: 'scan',
@@ -289,18 +295,22 @@ export async function scheduleAutoSnapshotJobs(pool: Pool, problem: ProblemT, ac
 }
 
 export async function scheduleDirtySnapshotBatch(pool: Pool, actor: string, limit: number): Promise<Array<{ problem_id: string; scan_job_id: string; snapshot_job_id: string }>> {
+  const config = maintenanceConfig();
   const { rows } = await pool.query(
     `SELECT p.* FROM problems p
      JOIN problem_usage pu ON pu.problem_id = p.external_id
      WHERE p.catalog_state IN ('present', 'mirror')
        AND pu.local_status = 'present'
+       AND (pu.snapshot_failure_count < $2
+         OR pu.last_snapshot_failed_at IS NULL
+         OR pu.last_snapshot_failed_at <= now() - ($3::double precision * interval '1 millisecond'))
        AND (
          p.dirty = true
          OR NOT EXISTS (SELECT 1 FROM snapshots s WHERE s.problem_id = p.external_id AND s.state = 'ready')
        )
      ORDER BY p.observed_at ASC, p.external_id ASC
      LIMIT $1`,
-    [limit],
+    [limit, config.permanentFailureThreshold, config.snapshotBackoffIntervalMs],
   );
   const scheduled = [];
   let skipped = 0;
@@ -2170,4 +2180,33 @@ function sortJson(value: unknown): unknown {
     );
   }
   return value;
+}
+
+// idempotency_keys stores only problem.dirty responses (a problem FK), not job
+// results. Keep these keys: deleting terminal jobs must not replay dirty events.
+export async function purgeTerminalJobs(
+  pool: Pool, batchSize = TERMINAL_JOB_DELETE_BATCH_SIZE,
+): Promise<number> {
+  if (!Number.isSafeInteger(batchSize) || batchSize <= 0) {
+    throw new Error('Terminal job delete batch size must be a positive integer');
+  }
+  const { terminalJobRetentionDays } = maintenanceConfig();
+  let total = 0;
+  for (;;) {
+    const { rowCount } = await pool.query(
+      `WITH expired AS (
+         SELECT id FROM jobs
+         WHERE state IN ('completed', 'failed', 'cancelled')
+           AND updated_at < now() - ($1::double precision * interval '1 day')
+         ORDER BY updated_at, id
+         LIMIT $2
+         FOR UPDATE SKIP LOCKED
+       )
+       DELETE FROM jobs j USING expired e WHERE j.id = e.id`,
+      [terminalJobRetentionDays, batchSize],
+    );
+    const deleted = rowCount ?? 0;
+    total += deleted;
+    if (deleted < batchSize) return total;
+  }
 }

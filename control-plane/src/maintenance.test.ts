@@ -8,6 +8,7 @@ const job = { id: 'gc-job' } as JobT;
 
 function dependencies(eligible: boolean) {
   return {
+    purgeTerminalJobs: vi.fn().mockResolvedValue(0),
     applyRetention: vi.fn().mockResolvedValue({ gc_marks: 1 }),
     listGcEligible: vi.fn().mockResolvedValue(eligible
       ? [{ id: 'mark-1', sha256: 'a'.repeat(64), object_key: `objects/sha256/aa/${'a'.repeat(64)}` }]
@@ -18,7 +19,7 @@ function dependencies(eligible: boolean) {
     scheduleDirtySnapshotBatch: vi.fn().mockResolvedValue([]),
   } satisfies Pick<
     typeof DbModule,
-    'applyRetention' | 'listGcEligible' | 'createJob' | 'setJobPayload' | 'stableFingerprint' | 'scheduleDirtySnapshotBatch'
+    'purgeTerminalJobs' | 'applyRetention' | 'listGcEligible' | 'createJob' | 'setJobPayload' | 'stableFingerprint' | 'scheduleDirtySnapshotBatch'
   >;
 }
 
@@ -29,6 +30,7 @@ describe('maintenance scheduler', () => {
 
     await scheduler.runOnce();
 
+    expect(deps.purgeTerminalJobs).toHaveBeenCalledOnce();
     expect(deps.applyRetention).toHaveBeenCalledOnce();
     expect(deps.listGcEligible).toHaveBeenCalledWith(expect.anything(), 1);
     expect(deps.createJob).not.toHaveBeenCalled();

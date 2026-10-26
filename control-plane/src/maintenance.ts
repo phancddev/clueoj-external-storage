@@ -8,7 +8,7 @@ const GC_BATCH_SIZE = 500;
 const RESCHEDULE_BATCH_SIZE = 200;
 type MaintenanceDb = Pick<
   typeof db,
-  'applyRetention' | 'listGcEligible' | 'createJob' | 'setJobPayload' | 'stableFingerprint' | 'scheduleDirtySnapshotBatch'
+  'purgeTerminalJobs' | 'applyRetention' | 'listGcEligible' | 'createJob' | 'setJobPayload' | 'stableFingerprint' | 'scheduleDirtySnapshotBatch'
 >;
 
 export class MaintenanceScheduler {
@@ -86,6 +86,8 @@ export class MaintenanceScheduler {
 
   async runOnce(): Promise<void> {
     try {
+      const purged = await this.maintenanceDb.purgeTerminalJobs(this.pool);
+      logger.info({ purged }, 'purged terminal storage jobs');
       const retention = await this.maintenanceDb.applyRetention(this.pool);
       const eligible = await this.maintenanceDb.listGcEligible(this.pool, 1);
       if (eligible.length > 0) {
