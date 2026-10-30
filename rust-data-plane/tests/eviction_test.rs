@@ -180,6 +180,66 @@ async fn guarded_eviction_and_restore_round_trip() {
     .expect("read restored access fence");
     assert!(restored_access_is_fresh);
 
+    // Regression: a stale dirty flag must not block restoring an evicted
+    // (missing) folder. The dirty flag can only represent local edits, and
+    // there is no local copy left to conflict with the publication.
+    sqlx::query(r#"UPDATE problems SET dirty = true WHERE external_id = 'p-evict'"#)
+        .execute(&pool)
+        .await
+        .expect("mark problem dirty");
+    sqlx::query(
+        r#"UPDATE problem_usage
+           SET last_accessed_at = now() - interval '25 hours'
+           WHERE problem_id = 'p-evict'"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("age access fence again");
+    sqlx::query(
+        r#"INSERT INTO jobs
+             (idempotency_key, job_type, problem_id, state, fencing_token, request_fingerprint)
+           VALUES ('dirty-evict-job', 'evict', 'p-evict', 'running', 5, 'dirty-evict')"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("insert dirty eviction job");
+    manager
+        .evict_local("p-evict", root.path(), "sum", false, true, 5, Some(cutoff))
+        .await
+        .expect("evict local copy with dirty flag");
+    assert!(!problem_dir.exists());
+    sqlx::query(
+        r#"UPDATE jobs SET state = 'completed', completed_at = now()
+           WHERE idempotency_key = 'dirty-evict-job'"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("complete dirty eviction job");
+    sqlx::query(
+        r#"INSERT INTO jobs
+             (idempotency_key, job_type, problem_id, target_generation, state,
+              fencing_token, request_fingerprint)
+           VALUES ('dirty-restore-job', 'restore', 'p-evict', 1, 'running', 6, 'dirty-restore')"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("insert dirty restore job");
+    manager
+        .restore_snapshot("p-evict", 1, 6, &problem_dir)
+        .await
+        .expect("restore despite stale dirty flag");
+    assert_eq!(
+        std::fs::read(problem_dir.join("tests.zip")).expect("read restored tests again"),
+        b"snapshot bytes",
+    );
+    // The dirty flag survives so the scheduler still re-snapshots the folder.
+    let still_dirty: bool =
+        sqlx::query_scalar("SELECT dirty FROM problems WHERE external_id = 'p-evict'")
+            .fetch_one(&pool)
+            .await
+            .expect("read dirty flag");
+    assert!(still_dirty);
+
     pool.close().await;
     admin
         .execute(format!(r#"DROP SCHEMA "{schema}" CASCADE"#).as_str())

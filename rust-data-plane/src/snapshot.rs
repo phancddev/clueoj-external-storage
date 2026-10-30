@@ -669,16 +669,20 @@ impl SnapshotManager {
                 generation,
             });
         }
-        let dirty: bool =
-            sqlx::query_scalar("SELECT dirty FROM problems WHERE external_id = $1 FOR UPDATE")
-                .bind(problem_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if dirty {
-            let _ = tokio::fs::remove_dir_all(&staging).await;
-            return Err(AppError::FileChurn(problem_id.to_string()));
-        }
+        // The dirty flag only represents local edits that still need a
+        // snapshot. When the local folder is missing there are no local files
+        // to conflict with, so a stale dirty flag must not block publication —
+        // otherwise an evicted problem can never be restored.
         if dest.exists() {
+            let dirty: bool =
+                sqlx::query_scalar("SELECT dirty FROM problems WHERE external_id = $1 FOR UPDATE")
+                    .bind(problem_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if dirty {
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+                return Err(AppError::FileChurn(problem_id.to_string()));
+            }
             let code = dest
                 .file_name()
                 .and_then(|value| value.to_str())
