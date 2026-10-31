@@ -78,6 +78,74 @@ pub async fn connect(url: &str) -> AppResult<PgPool> {
     Ok(pool)
 }
 
+pub async fn cached_tree(
+    pool: &PgPool,
+    code: &str,
+) -> AppResult<Option<(String, Option<String>, Option<String>)>> {
+    Ok(
+        sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT fingerprint, canonical_download_path, usage_fingerprint \
+         FROM problem_tree_cache WHERE code = $1",
+        )
+        .bind(code)
+        .fetch_optional(pool)
+        .await?,
+    )
+}
+
+pub async fn cache_tree(
+    pool: &PgPool,
+    code: &str,
+    fingerprint: &str,
+    canonical_download_path: Option<&str>,
+    accounted: bool,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO problem_tree_cache \
+         (code, fingerprint, canonical_download_path, usage_fingerprint) \
+         VALUES ($1, $2, $3, CASE WHEN $4 THEN $2 ELSE NULL END) \
+         ON CONFLICT (code) DO UPDATE SET \
+         fingerprint = EXCLUDED.fingerprint, \
+         canonical_download_path = EXCLUDED.canonical_download_path, \
+         usage_fingerprint = CASE WHEN $4 THEN EXCLUDED.fingerprint \
+             WHEN problem_tree_cache.fingerprint = EXCLUDED.fingerprint \
+             THEN problem_tree_cache.usage_fingerprint ELSE NULL END, \
+         updated_at = now()",
+    )
+    .bind(code)
+    .bind(fingerprint)
+    .bind(canonical_download_path)
+    .bind(accounted)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn invalidate_tree_cache(pool: &PgPool, code: &str) -> AppResult<()> {
+    sqlx::query("DELETE FROM problem_tree_cache WHERE code = $1")
+        .bind(code)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn usage_is_current(
+    pool: &PgPool,
+    code: &str,
+    expected_id: Option<&str>,
+) -> AppResult<bool> {
+    let current: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM problems p JOIN problem_usage u ON u.problem_id = p.external_id \
+         WHERE p.code = $1 AND ($2::text IS NULL OR p.external_id = $2) \
+         AND u.local_status IN ('present', 'orphan') AND NOT u.stale)",
+    )
+    .bind(code)
+    .bind(expected_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(current)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_problem_usage(
     pool: &PgPool,

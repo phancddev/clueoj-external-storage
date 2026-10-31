@@ -125,6 +125,36 @@ async fn problem_readiness(
             observed_at: chrono::Utc::now(),
         });
     }
+    let before = match scanner::tree_fingerprint(s.problem_root.as_ref(), code) {
+        Ok(fingerprint) => fingerprint,
+        Err(_) => {
+            return Ok(ProblemReadyResponse {
+                ready: false,
+                local_status: "partial".to_string(),
+                generation: None,
+                observed_at: chrono::Utc::now(),
+            });
+        }
+    };
+    if let Some((saved, canonical, _)) = crate::db::cached_tree(&s.db, code).await? {
+        if saved == before {
+            let generation: Option<i64> = sqlx::query_scalar(
+                "SELECT generation::BIGINT FROM snapshots WHERE problem_id = $1 \
+                 AND state = 'ready' ORDER BY generation DESC LIMIT 1",
+            )
+            .bind(problem_external_id)
+            .fetch_optional(&s.db)
+            .await?;
+            let usable = canonical.is_some();
+            return Ok(ProblemReadyResponse {
+                ready: usable,
+                local_status: if usable { "present" } else { "partial" }.to_string(),
+                generation,
+                observed_at: chrono::Utc::now(),
+            });
+        }
+        crate::db::invalidate_tree_cache(&s.db, code).await?;
+    }
     let scan = match scanner::scan_problem_folder(s.problem_root.as_ref(), code) {
         Ok(scan) => scan,
         Err(_) => {
@@ -137,6 +167,13 @@ async fn problem_readiness(
         }
     };
     let canonical = scanner::canonical_download_path_from_folder(&folder, &scan.files);
+    if scanner::tree_fingerprint(s.problem_root.as_ref(), code)
+        .ok()
+        .as_deref()
+        == Some(before.as_str())
+    {
+        crate::db::cache_tree(&s.db, code, &before, canonical.as_deref(), false).await?;
+    }
     let matched_generation = if canonical.is_some() {
         crate::db::ready_snapshot_matches_scan(&s.db, problem_external_id, &scan).await?
     } else {

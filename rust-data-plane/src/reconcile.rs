@@ -53,9 +53,18 @@ async fn apply_reconcile_plan(
     db: &PgPool,
     plan: ReconcilePlan,
 ) -> AppResult<ReconcileResult> {
+    let mut reused = 0usize;
+    let mut scanned = 0usize;
     for item in &plan.known_present {
         db::remove_orphan_projection_for_code(db, &item.code).await?;
+        if cached_usage_matches(root, db, &item.code, Some(&item.external_id)).await? {
+            reused += 1;
+            continue;
+        }
+        db::invalidate_tree_cache(db, &item.code).await?;
+        let before = scanner::tree_fingerprint(root, &item.code)?;
         let scan = scanner::scan_problem_folder(root, &item.code)?;
+        scanned += 1;
         db::upsert_problem_usage(
             db,
             &item.external_id,
@@ -68,6 +77,7 @@ async fn apply_reconcile_plan(
             "present",
         )
         .await?;
+        cache_stable_scan(root, db, &item.code, &before, &scan).await?;
     }
 
     for item in &plan.missing_known {
@@ -75,7 +85,14 @@ async fn apply_reconcile_plan(
     }
 
     for code in &plan.orphans {
+        if cached_usage_matches(root, db, code, None).await? {
+            reused += 1;
+            continue;
+        }
+        db::invalidate_tree_cache(db, code).await?;
+        let before = scanner::tree_fingerprint(root, code)?;
         if let Ok(scan) = scanner::scan_problem_folder(root, code) {
+            scanned += 1;
             db::upsert_discovered_usage(
                 db,
                 code,
@@ -86,8 +103,11 @@ async fn apply_reconcile_plan(
                 scan.file_count,
             )
             .await?;
+            cache_stable_scan(root, db, code, &before, &scan).await?;
         }
     }
+
+    tracing::info!(reused, scanned, "problem reconciliation scan summary");
 
     Ok(ReconcileResult {
         discovered: plan.known_present.len() as i64,
@@ -101,6 +121,43 @@ async fn apply_reconcile_plan(
             .map(|item| item.code)
             .collect(),
     })
+}
+
+async fn cached_usage_matches(
+    root: &Path,
+    db: &PgPool,
+    code: &str,
+    id: Option<&str>,
+) -> AppResult<bool> {
+    let Some((_, _, accounted)) = db::cached_tree(db, code).await? else {
+        return Ok(false);
+    };
+    let Some(saved) = accounted else {
+        return Ok(false);
+    };
+    let current = scanner::tree_fingerprint(root, code)?;
+    Ok(saved == current && db::usage_is_current(db, code, id).await?)
+}
+
+async fn cache_stable_scan(
+    root: &Path,
+    db: &PgPool,
+    code: &str,
+    before: &str,
+    scan: &crate::models::ScanResult,
+) -> AppResult<()> {
+    let after = scanner::tree_fingerprint(root, code)?;
+    if before == after {
+        let folder = crate::paths::safe_problem_folder(root, code)?;
+        let canonical = scanner::canonical_download_path_from_folder(&folder, &scan.files);
+        db::cache_tree(db, code, before, canonical.as_deref(), true).await?;
+    } else {
+        tracing::warn!(
+            code,
+            "problem changed during reconciliation; cache not updated"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

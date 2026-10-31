@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::error::{AppError, AppResult};
@@ -209,6 +210,54 @@ pub fn scan_problem_folder(root: &Path, code: &str) -> AppResult<ScanResult> {
         files,
         observed_at: chrono::Utc::now(),
     })
+}
+
+/// Hash names and filesystem metadata without reading file contents. This is a
+/// change detector, not a content checksum: a cache miss still requires a full scan.
+pub fn tree_fingerprint(root: &Path, code: &str) -> AppResult<String> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let folder = paths::safe_problem_folder(root, code)?;
+    if !folder.is_dir() {
+        return Err(AppError::ProblemFolderMissing(code.to_string()));
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"problem-tree-v1\0");
+    for entry in WalkDir::new(&folder)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        let entry = entry.map_err(|e| AppError::Internal(format!("walkdir error: {e}")))?;
+        let meta = std::fs::symlink_metadata(entry.path())?;
+        let relative = entry
+            .path()
+            .strip_prefix(&folder)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let name = relative.as_os_str().as_bytes();
+        hash.update((name.len() as u64).to_le_bytes());
+        hash.update(name);
+        for value in [
+            meta.dev(),
+            meta.ino(),
+            meta.mode() as u64,
+            meta.len(),
+            meta.blocks(),
+            meta.mtime() as u64,
+            meta.mtime_nsec() as u64,
+            meta.ctime() as u64,
+            meta.ctime_nsec() as u64,
+        ] {
+            hash.update(value.to_le_bytes());
+        }
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(entry.path())?;
+            let bytes = target.as_os_str().as_bytes();
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+    }
+    Ok(hex::encode(hash.finalize()))
 }
 
 pub fn list_problem_codes(root: &Path) -> AppResult<Vec<String>> {

@@ -4,8 +4,25 @@ use rust_data_plane::paths::{
 };
 use rust_data_plane::scanner::{
     canonical_download_path_from_folder, list_problem_codes, scan_problem_folder, scan_volume,
+    tree_fingerprint,
 };
 use std::fs;
+
+#[test]
+fn tree_fingerprint_detects_nested_changes_without_content_hashing() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = root.path().join("sum");
+    fs::create_dir_all(folder.join("nested")).unwrap();
+    let file = folder.join("nested/data.bin");
+    fs::write(&file, b"first").unwrap();
+    let first = tree_fingerprint(root.path(), "sum").unwrap();
+    assert_eq!(first, tree_fingerprint(root.path(), "sum").unwrap());
+    fs::write(&file, b"different content").unwrap();
+    let second = tree_fingerprint(root.path(), "sum").unwrap();
+    assert_ne!(first, second);
+    fs::rename(&file, folder.join("nested/renamed.bin")).unwrap();
+    assert_ne!(second, tree_fingerprint(root.path(), "sum").unwrap());
+}
 
 #[test]
 fn test_scan_volume_returns_stats() {

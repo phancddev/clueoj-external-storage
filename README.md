@@ -73,6 +73,13 @@ Copy `.env.example` to `.env` and fill in:
 - `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_ENDPOINT`
 - `R2_PRESIGN_TTL_SECONDS` — URL TTL (default 180, max 300)
 
+The Rust data plane reconciles problem usage every 60 seconds by default
+(`STORAGE_RECONCILE_INTERVAL_SECONDS`). It hashes path names and filesystem
+metadata first and reuses the stored result for unchanged trees. The first
+check after migration, or a changed tree, still reads and hashes file contents.
+The metadata check visits directory entries but does not read file contents.
+Explicit scan and snapshot requests still perform full content verification.
+
 ### Docker Compose services
 | Service | Port | Purpose |
 |---------|------|---------|
