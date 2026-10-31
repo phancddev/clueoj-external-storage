@@ -51,7 +51,12 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.bind).await?;
     tracing::info!("listening on {}", config.bind);
 
-    watcher::spawn_watcher(problem_root.clone(), pool.clone(), store.clone());
+    watcher::spawn_watcher(
+        problem_root.clone(),
+        pool.clone(),
+        store.clone(),
+        config.judge_update_urls(),
+    );
     tokio::spawn(reconcile::full_reconcile(
         problem_root.clone(),
         pool.clone(),

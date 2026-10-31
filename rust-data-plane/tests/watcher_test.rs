@@ -1,4 +1,8 @@
-use rust_data_plane::watcher::{debounce_wait_for_age, problem_codes_from_paths};
+use notify::event::RemoveKind;
+use notify::{Event, EventKind};
+use rust_data_plane::watcher::{
+    debounce_wait_for_age, problem_codes_from_event, problem_codes_from_paths,
+};
 
 #[test]
 fn test_problem_codes_from_all_event_paths() {
@@ -30,6 +34,34 @@ fn test_problem_codes_ignore_hidden_root_entries() {
     ];
 
     assert_eq!(problem_codes_from_paths(root, &paths), vec!["visible"]);
+}
+
+#[test]
+fn test_root_cache_writes_do_not_trigger_problem_updates() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("sum")).unwrap();
+    let paths = vec![
+        root.path().join("cache.pkl"),
+        root.path().join("cache.pkl.tmp"),
+        root.path().join(".cache.pkl.tmp"),
+        root.path().join("judge01.yml"),
+    ];
+    assert!(problem_codes_from_paths(root.path(), &paths).is_empty());
+    assert_eq!(
+        problem_codes_from_paths(root.path(), &[root.path().join("sum/tests.zip")]),
+        vec!["sum"]
+    );
+}
+
+#[test]
+fn test_deleted_problem_folder_still_triggers_update() {
+    let root = std::path::Path::new("/problems");
+    let event =
+        Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(root.join("removed_problem"));
+    assert_eq!(
+        problem_codes_from_event(root, &event),
+        vec!["removed_problem"]
+    );
 }
 
 #[test]

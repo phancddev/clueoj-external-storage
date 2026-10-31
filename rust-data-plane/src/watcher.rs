@@ -2,7 +2,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::event::{CreateKind, RemoveKind};
+use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 
@@ -22,7 +23,12 @@ struct DebounceState {
     deadline: tokio::time::Instant,
 }
 
-pub fn spawn_watcher(root: Arc<Path>, db: PgPool, store: Arc<dyn ObjectStore>) {
+pub fn spawn_watcher(
+    root: Arc<Path>,
+    db: PgPool,
+    store: Arc<dyn ObjectStore>,
+    judge_update_urls: Vec<String>,
+) {
     let root_for_closure = root.clone();
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::channel::<String>(256);
@@ -30,7 +36,7 @@ pub fn spawn_watcher(root: Arc<Path>, db: PgPool, store: Arc<dyn ObjectStore>) {
         let mut watcher = match RecommendedWatcher::new(
             move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
-                    for code in problem_codes_from_paths(root_for_cb.as_ref(), &event.paths) {
+                    for code in problem_codes_from_event(root_for_cb.as_ref(), &event) {
                         let _ = tx.blocking_send(code);
                     }
                 }
@@ -49,6 +55,20 @@ pub fn spawn_watcher(root: Arc<Path>, db: PgPool, store: Arc<dyn ObjectStore>) {
             return;
         }
         tracing::info!(root = ?root.as_ref(), "filesystem watcher started");
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("valid judge notification client");
+        let (notify_tx, mut notify_rx) = mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            while notify_rx.recv().await.is_some() {
+                notify_judges(&http, &judge_update_urls).await;
+            }
+        });
+        // Refresh once after a storage restart in case problem changes happened
+        // while this watcher was down. Judges also enumerate on their own start.
+        let _ = notify_tx.try_send(());
 
         let mut debounce: std::collections::HashMap<String, DebounceState> =
             std::collections::HashMap::new();
@@ -71,6 +91,9 @@ pub fn spawn_watcher(root: Arc<Path>, db: PgPool, store: Arc<dyn ObjectStore>) {
                         .filter(|(_, state)| state.deadline <= now)
                         .map(|(code, _)| code.clone())
                         .collect();
+                    if !ready.is_empty() {
+                        let _ = notify_tx.try_send(());
+                    }
                     for code in ready {
                         debounce.remove(&code);
                         if let Err(e) = snapshot_dirty_code(root.as_ref(), &db, store.clone(), &code).await {
@@ -81,6 +104,21 @@ pub fn spawn_watcher(root: Arc<Path>, db: PgPool, store: Arc<dyn ObjectStore>) {
             }
         }
     });
+}
+
+async fn notify_judges(client: &reqwest::Client, urls: &[String]) {
+    futures::future::join_all(urls.iter().map(|url| async move {
+        for attempt in 0..3 {
+            match client.post(url).send().await {
+                Ok(response) if response.status().is_success() => return,
+                Ok(response) => tracing::warn!(url, status = %response.status(), attempt, "judge update rejected"),
+                Err(error) => tracing::warn!(url, %error, attempt, "judge update failed"),
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+            }
+        }
+    })).await;
 }
 
 async fn sleep_until_optional(deadline: Option<tokio::time::Instant>) {
@@ -263,16 +301,73 @@ async fn scan_orphan_now(root: &Path, db: &PgPool, code: &str) -> crate::error::
 pub fn problem_codes_from_paths(root: &Path, paths: &[std::path::PathBuf]) -> Vec<String> {
     let mut codes = std::collections::BTreeSet::new();
     for path in paths {
-        if let Some(code) = path
-            .strip_prefix(root)
-            .ok()
-            .and_then(|p| p.iter().next())
-            .and_then(|s| s.to_str())
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let mut parts = relative.iter();
+        let Some(code) = parts.next().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !code.starts_with('.')
+            && crate::paths::validate_problem_code(code).is_ok()
+            && (parts.next().is_some() || root.join(code).is_dir())
         {
+            codes.insert(code.to_string());
+        }
+    }
+    codes.into_iter().collect()
+}
+
+pub fn problem_codes_from_event(root: &Path, event: &notify::Event) -> Vec<String> {
+    let mut codes: std::collections::BTreeSet<String> =
+        problem_codes_from_paths(root, &event.paths)
+            .into_iter()
+            .collect();
+    if matches!(
+        event.kind,
+        EventKind::Remove(RemoveKind::Folder) | EventKind::Create(CreateKind::Folder)
+    ) {
+        for path in &event.paths {
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            if relative.components().count() != 1 {
+                continue;
+            }
+            let Some(code) = relative.to_str() else {
+                continue;
+            };
             if !code.starts_with('.') && crate::paths::validate_problem_code(code).is_ok() {
                 codes.insert(code.to_string());
             }
         }
     }
     codes.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::notify_judges;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn judge_notification_uses_control_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let bytes = socket.read(&mut request).await.unwrap();
+            assert!(std::str::from_utf8(&request[..bytes])
+                .unwrap()
+                .starts_with("POST /update/problems HTTP/1.1"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let endpoint = format!("http://{address}/update/problems");
+        notify_judges(&reqwest::Client::new(), &[endpoint]).await;
+        server.await.unwrap();
+    }
 }

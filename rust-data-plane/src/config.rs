@@ -54,14 +54,41 @@ pub struct Config {
 
     #[arg(long, env = "STORAGE_RECONCILE_INTERVAL_SECONDS", default_value_t = 60)]
     pub reconcile_interval: u64,
+
+    /// Comma-separated private DMOJ control URLs ending in /update/problems.
+    #[arg(long, env = "STORAGE_JUDGE_UPDATE_URLS", default_value = "")]
+    pub judge_update_urls: String,
 }
 
 impl Config {
+    pub fn judge_update_urls(&self) -> Vec<String> {
+        self.judge_update_urls
+            .split(',')
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
     pub fn presign_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.r2_presign_ttl.min(300))
     }
 
     pub fn validate_fail_closed(&self) -> anyhow::Result<()> {
+        for endpoint in self.judge_update_urls() {
+            let url = reqwest::Url::parse(&endpoint)?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || url.path() != "/update/problems"
+                || url.query().is_some()
+                || !url.username().is_empty()
+                || url.password().is_some()
+            {
+                anyhow::bail!(
+                    "STORAGE_JUDGE_UPDATE_URLS must contain private /update/problems HTTP URLs"
+                );
+            }
+        }
         if self.internal_token.is_empty() && !self.allow_insecure_dev {
             anyhow::bail!(
                 "STORAGE_INTERNAL_SERVICE_TOKEN is required unless STORAGE_ALLOW_INSECURE_DEV=true"

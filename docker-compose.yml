@@ -103,6 +103,7 @@ services:
     environment:
       STORAGE_PROBLEM_ROOT: ${STORAGE_PROBLEM_ROOT_CONTAINER:-/problems}
       STORAGE_BIND: 0.0.0.0:8081
+      STORAGE_JUDGE_UPDATE_URLS: ${STORAGE_JUDGE_UPDATE_URLS:?Set private control URLs for every judge}
     env_file:
       - path: .env
         required: false
@@ -122,6 +123,7 @@ services:
       start_period: 10s
     networks:
       - storage-net
+      - clueoj-site
 
   storage-web:
     build:
@@ -167,3 +169,6 @@ volumes:
 networks:
   storage-net:
     driver: bridge
+  clueoj-site:
+    external: true
+    name: ${CLUEOJ_SITE_NETWORK:-clueoj_site}

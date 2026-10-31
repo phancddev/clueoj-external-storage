@@ -80,6 +80,17 @@ check after migration, or a changed tree, still reads and hashes file contents.
 The metadata check visits directory entries but does not read file contents.
 Explicit scan and snapshot requests still perform full content verification.
 
+Judge problem updates are sent by the Rust filesystem watcher after a short
+debounce. Configure `STORAGE_JUDGE_UPDATE_URLS` with the private
+`/update/problems` URL of every judge, and `CLUEOJ_SITE_NETWORK` with the
+ClueOJ Compose site network. The three judges in the included ClueOJ Compose
+file run with `--no-watchdog`; changes under real problem directories still
+trigger their updates through this notifier. Root-level files such as
+`cache.pkl` do not trigger updates. Start the ClueOJ network before the storage
+stack. If additional judges run elsewhere, include their reachable private
+control URLs in `STORAGE_JUDGE_UPDATE_URLS`. Compose requires this setting so
+judges cannot silently lose automatic test updates.
+
 ### Docker Compose services
 | Service | Port | Purpose |
 |---------|------|---------|
